@@ -524,6 +524,8 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
                         f"<|audio_bos|><|AUDIO|><|audio_eos|>")
             if model_type == "minicpmo":
                 return "(<audio>./</audio>)"
+            if model_type == "higgs_audio":
+                return "<|audio_bos|><|AUDIO|><|audio_eos|>"
             raise TypeError(f"Unknown model type: {model_type}")
         elif modality == "video":
             if model_type in ("qwen2_vl", "qwen2_5_vl"):
