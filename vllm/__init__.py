@@ -50,3 +50,12 @@ __all__ = [
     "initialize_ray_cluster",
     "PoolingParams",
 ]
+
+# TODO: Remove this once we register into the transformers
+from transformers import AutoConfig
+
+from vllm.model_executor.models.higgs_audio_config import (
+    HiggsAudioConfig, HiggsAudioEncoderConfig)
+
+AutoConfig.register("higgs_audio_encoder", HiggsAudioEncoderConfig)
+AutoConfig.register("higgs_audio", HiggsAudioConfig)
