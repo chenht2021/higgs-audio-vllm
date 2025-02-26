@@ -1124,6 +1124,11 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if self.config.audio_adapter_type == "stack":
+                audio_param_names = ["audio_attn", "audio_input_layernorm", "audio_mlp",
+                                     "audio_post_attention_layernorm"]
+                if any(p in name for p in audio_param_names):
+                    continue
             # Skip audio_lm_head if we are not using audio out.
             if not self.use_audio_out and "audio_lm_head" in name:
                 continue
