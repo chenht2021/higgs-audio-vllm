@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# ruff: noqa
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
 
@@ -39,7 +41,7 @@ class HiggsAudioEncoderConfig(PretrainedConfig):
         self.encoder_layerdrop = encoder_layerdrop
         self.num_hidden_layers = encoder_layers
         self.init_std = init_std
-        self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
+        self.scale_embedding = scale_embedding
         self.max_source_positions = max_source_positions
         self.pad_token_id = pad_token_id
 
@@ -142,22 +144,17 @@ class HiggsAudioConfig(PretrainedConfig):
         **kwargs,
     ):
         if isinstance(audio_encoder_config, dict):
-            audio_encoder_config["model_type"] = (
-                audio_encoder_config["model_type"]
-                if "model_type" in audio_encoder_config
-                else "higgs_audio_encoder"
-            )
-            audio_encoder_config = CONFIG_MAPPING[audio_encoder_config["model_type"]](
-                **audio_encoder_config
-            )
+            audio_encoder_config["model_type"] = audio_encoder_config.get(
+                "model_type", "higgs_audio_encoder")
+            audio_encoder_config = CONFIG_MAPPING[
+                audio_encoder_config["model_type"]](**audio_encoder_config)
         elif audio_encoder_config is None:
             audio_encoder_config = HiggsAudioEncoderConfig()
 
         if isinstance(text_config, dict):
-            text_config["model_type"] = (
-                text_config["model_type"] if "model_type" in text_config else "llama"
-            )
-            text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
+            text_config["model_type"] = text_config.get("model_type", "llama")
+            text_config = CONFIG_MAPPING[text_config["model_type"]](
+                **text_config)
         elif text_config is None:
             text_config = CONFIG_MAPPING["llama"]()
 
