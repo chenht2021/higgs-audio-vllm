@@ -19,4 +19,12 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         request.status = RequestStatus.FINISHED_STOPPED
         request.stop_reason = last_token_id
         return True
+
+    # HACK: Stop for the delay pattern.
+    if request._audio_num_codebooks is not None and \
+        request._num_audio_eos >= request._audio_num_codebooks:
+        request.status = RequestStatus.FINISHED_STOPPED
+        request.stop_reason = request.output_mm_token_ids[-1][-1]
+        return True
+
     return False

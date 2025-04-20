@@ -343,6 +343,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
+                output_mm_token_ids=[],
                 lora_request=new_req_data.lora_request,
             )
 
@@ -392,6 +393,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_new_tokens == 1:
                 # Avoid slicing list in most common case.
                 req_state.output_token_ids.append(req_data.new_token_ids[-1])
+                if req_data.new_mm_token_ids is not None and \
+                    len(req_data.new_mm_token_ids) > 0 and \
+                    req_state.output_mm_token_ids is not None:
+                    req_state.output_mm_token_ids.append(
+                        req_data.new_mm_token_ids)
             elif num_new_tokens > 0:
                 req_state.output_token_ids.extend(
                     req_data.new_token_ids[-num_new_tokens:])
@@ -841,8 +847,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
             for input_id in encoder_input_ids:
-                mm_inputs.append(req_state.mm_inputs[input_id])
-                req_input_ids.append((req_id, input_id))
+                if input_id == -1:
+                    assert req_state.output_mm_token_ids is not None
+                    mm_inputs.append(
+                        MultiModalKwargs({
+                            "audio_out_ids":
+                            req_state.output_mm_token_ids[-1]
+                        }))
+                    req_input_ids.append((req_id, input_id))
+                else:
+                    mm_inputs.append(req_state.mm_inputs[input_id])
+                    req_input_ids.append((req_id, input_id))
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -919,6 +934,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert i in self.encoder_cache[req_id]
                 encoder_output = self.encoder_cache[req_id][i]
                 encoder_outputs.append(encoder_output[start_idx:end_idx])
+
+            # HACK: Append the output mm token ids to here
+            if req_id in self.encoder_cache and -1 in self.encoder_cache[
+                    req_id]:
+                encoder_outputs.append(self.encoder_cache[req_id][-1])
+
         return encoder_outputs
 
     def get_model(self) -> nn.Module:
@@ -1071,6 +1092,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            if isinstance(sampler_output, tuple):
+                sampler_output, mm_sampler_output = sampler_output
+            else:
+                mm_sampler_output = None
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -1129,9 +1154,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
+        valid_sampled_mm_token_ids = None
         if max_gen_len == 1:
             # No spec decode tokens.
             valid_sampled_token_ids = sampled_token_ids.tolist()
+            if mm_sampler_output is not None:
+                valid_sampled_mm_token_ids = \
+                    mm_sampler_output.sampled_token_ids.tolist()
         else:
             # Includes spec decode tokens.
             valid_sampled_token_ids = self.rejection_sampler.parse_output(
@@ -1217,6 +1246,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=valid_sampled_token_ids,
+            sampled_mm_token_ids=valid_sampled_mm_token_ids,
             spec_token_ids=spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
@@ -1437,6 +1467,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> torch.Tensor:
 
         logits = self.model.compute_logits(hidden_states, None)
+        if isinstance(logits, tuple):
+            logits, mm_logits = logits
+        else:
+            mm_logits = None
+
         num_reqs = logits.size(0)
 
         dummy_tensors = lambda v: torch.full(
@@ -1463,6 +1498,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             bad_words_token_ids={},
         )
         try:
+            if mm_logits is not None:
+                logits = (logits, mm_logits)
             sampler_output = self.model.sample(
                 logits=logits, sampling_metadata=dummy_metadata)
         except RuntimeError as e:

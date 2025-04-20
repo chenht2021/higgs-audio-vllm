@@ -34,6 +34,8 @@ class CachedRequestState:
     num_computed_tokens: int
     output_token_ids: list[int]
 
+    output_mm_token_ids: Optional[list[list[int]]] = None
+
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[int] = None
 

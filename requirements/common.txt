@@ -44,3 +44,4 @@ python-json-logger # Used by logging as per examples/other/logging_configuration
 scipy # Required for phi-4-multimodal-instruct
 ninja # Required for xgrammar, rocm, tpu, xpu
 librosa
+s3fs

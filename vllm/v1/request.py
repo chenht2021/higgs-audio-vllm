@@ -3,6 +3,8 @@
 import enum
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
+
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (EngineCoreEvent, EngineCoreEventType,
                             EngineCoreRequest, FinishReason)
@@ -73,6 +75,16 @@ class Request:
         self.output_token_ids = ConstantList(self._output_token_ids)
         self.all_token_ids = ConstantList(self._all_token_ids)
 
+        self._output_mm_token_ids: list[list[int]] = []
+        self.output_mm_token_ids = ConstantList(self._output_mm_token_ids)
+
+        # Stats for the delay pattern
+        # HACK!! TODO: read audio_num_codebooks from model config
+        self._use_delay_pattern = True
+        self._num_audio_eos = 0
+        self._num_audio_delays = 0
+        self._audio_num_codebooks: Optional[int] = None
+
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "Request":
         return cls(
@@ -100,6 +112,33 @@ class Request:
         else:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
+
+    def append_output_mm_token_ids(
+        self,
+        mm_token_ids: list[int],
+        mm_bos_token_id: int,
+        mm_eos_token_id: int,
+    ) -> None:
+        self._output_mm_token_ids.append(mm_token_ids)
+        # Initialize audio codebooks if not already set
+        if self._audio_num_codebooks is None:
+            self._audio_num_codebooks = len(mm_token_ids)
+
+        # HACK: Check the delay pattern here.
+        # TODO: Move this to the sampler.
+        if self._num_audio_delays < self._audio_num_codebooks:
+            self._output_mm_token_ids[-1][self._num_audio_delays + 1:] = \
+                [mm_bos_token_id] * (self._audio_num_codebooks - \
+                                     self._num_audio_delays - 1)
+            self._num_audio_delays += 1
+        elif self._num_audio_eos < self._audio_num_codebooks:
+            mm_token_ids_np = np.array(mm_token_ids)
+            all_eos_indices = np.where(mm_token_ids_np == mm_eos_token_id)[0]
+            if len(all_eos_indices) > 0:
+                last_eos_index = all_eos_indices[-1]
+                self._output_mm_token_ids[-1][:last_eos_index] = \
+                    [mm_eos_token_id] * last_eos_index
+                self._num_audio_eos = last_eos_index + 1
 
     @property
     def num_tokens(self) -> int:

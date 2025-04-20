@@ -17,6 +17,7 @@ class IncrementalDetokenizer:
 
     # Generation data
     token_ids: list[int]
+    mm_token_ids: list[list[int]] = field(default_factory=list)
     output_text: str = ""
     tokens: list[str] = field(default_factory=list)
     prompt_len: int = 0
@@ -45,6 +46,10 @@ class IncrementalDetokenizer:
     def output_token_ids(self) -> list[int]:
         return self.token_ids if not self.prompt_len else (
             self.token_ids[self.prompt_len:])
+
+    @property
+    def output_mm_token_ids(self) -> list[list[int]]:
+        return self.mm_token_ids
 
     @classmethod
     def from_new_request(
@@ -75,6 +80,7 @@ class IncrementalDetokenizer:
             # Detokenizer mutates this list, so need a unique copy.
             # NOTE(Nick): could we take ownership of it though?
             token_ids=request.prompt_token_ids.copy(),
+            mm_token_ids=[],
             stop=stops,
             include_stop_str_in_output=request.sampling_params.
             include_stop_str_in_output,
@@ -88,8 +94,10 @@ class IncrementalDetokenizer:
             stop_buffer_length=stop_buffer_length,
         )
 
-    def update(self, new_token_ids: list[int],
-               stop_terminated: bool) -> Optional[str]:
+    def update(self,
+               new_token_ids: list[int],
+               stop_terminated: bool,
+               new_mm_token_ids: Optional[list[int]] = None) -> Optional[str]:
         """
         Update RequestState for the request_id by:
             1) Detokenize the new token ids incrementally.
@@ -103,6 +111,8 @@ class IncrementalDetokenizer:
         if self.tokenizer is None:
             # Skip detokenization if no tokenizer
             self.token_ids.extend(new_token_ids)
+            if new_mm_token_ids is not None:
+                self.mm_token_ids.append(new_mm_token_ids)
             return None
 
         if stop_terminated and not self.include_stop_str_in_output:
@@ -136,6 +146,9 @@ class IncrementalDetokenizer:
             self.read_offset = read_offset
 
             decoded_text += new_decoded_token_text
+
+        if new_mm_token_ids:
+            self.mm_token_ids.append(new_mm_token_ids)
 
         self.output_text += decoded_text
 

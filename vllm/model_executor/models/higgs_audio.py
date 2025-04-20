@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa
 """Inference-only Higgs Audio model compatible with HuggingFace weights."""
+import copy
 import math
 import os
 import warnings
@@ -19,6 +20,7 @@ from transformers.tokenization_utils_base import (PaddingStrategy,
                                                   PreTokenizedInput, TextInput)
 
 from vllm.attention import AttentionMetadata
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
@@ -61,6 +63,9 @@ _KEYS_TO_MODIFY_MAPPING = {
 AutoConfig.register("higgs_audio_encoder", HiggsAudioEncoderConfig)
 AutoConfig.register("higgs_audio", HiggsAudioConfig)
 
+HIGGS_AUDIO_TOKENIZER = os.getenv("HIGGS_AUDIO_TOKENIZER",
+                                  "openai/whisper-large-v3-turbo")
+
 
 # # === Audio Inputs === #
 class HiggsAudioInputs(TypedDict):
@@ -69,6 +74,9 @@ class HiggsAudioInputs(TypedDict):
 
     # (num_audios, 3000)
     audio_feature_attention_mask: torch.Tensor
+
+    # (num_audios, num_codebooks)
+    audio_out_ids: torch.Tensor
 
 
 # Revised on top of transformers.models.qwen2_audio.modeling_qwen2_audio
@@ -411,10 +419,8 @@ def get_processor(
     from transformers import AutoFeatureExtractor
 
     try:
-        feature_extractor_name = os.getenv("HIGGS_AUDIO_TOKENIZER",
-                                           "openai/whisper-large-v3-turbo")
         feature_extractor = AutoFeatureExtractor.from_pretrained(
-            feature_extractor_name,  # TODO: Write into config file
+            HIGGS_AUDIO_TOKENIZER,  # TODO: Write into config file
             *args,
             trust_remote_code=trust_remote_code,
             attn_implementation="sdpa",
@@ -706,7 +712,9 @@ class HiggsAudioMultiModalProcessor(
         if not mm_data.get("audios", []):
             prompt_ids = self.info.get_tokenizer().encode(prompt)
             prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+            batch_data = BatchFeature(dict(input_ids=[prompt_ids]),
+                                      tensor_type="pt")
+            return batch_data
 
         feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
         mm_kwargs = dict(
@@ -809,6 +817,14 @@ class HiggsAudioDummyInputsBuilder(
             "audio":
             self._get_dummy_audios(length=audio_len, num_audios=num_audios)
         }
+
+        # HACK: For Higgs audio generation, we need to insert the audio_out_ids
+        generate_audio_out_token = self.info.get_hf_config().skip_audio_tower
+        if generate_audio_out_token:
+            return ProcessorInputs(
+                prompt_text="<|AUDIO|>" * num_audios + "<|AUDIO_OUT|>",
+                mm_data=mm_data,
+            )
         return ProcessorInputs(
             prompt_text="<|AUDIO|>" * num_audios,
             mm_data=mm_data,
@@ -1055,6 +1071,7 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
     HiggsAudioMultiModalProcessor,
     info=HiggsAudioProcessingInfo,
     dummy_inputs=HiggsAudioDummyInputsBuilder)
+@support_torch_compile
 class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1124,7 +1141,12 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         # We add 1 for the audio_stream_bos token and 1
         # for theaudio_stream_eos token
         self.audio_codebook_size = (config.audio_codebook_size + 2)
-        self.use_audio_out = config.audio_decoder_proj_num_layers
+        self.audio_num_codebooks = config.audio_num_codebooks
+
+        # HACK: This is a hack to tell if it is a audio generation model
+        # FIXME: This should be fixed. We should simply reply on the token
+        # history to determine if we should generate audio out tokens.
+        self.generate_audio_out_token = config.skip_audio_tower
 
         if config.use_audio_out_embed_projector:
             self.audio_out_embed_projector = nn.Linear(
@@ -1143,13 +1165,12 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
             bias=False,
         )
 
-        if self.use_audio_out:
-            self.audio_lm_head = ParallelLMHead(
-                config.text_config.hidden_size,
-                config.audio_num_codebooks * (config.audio_codebook_size + 2),
-                quant_config=quant_config,
-                bias=False,
-            )
+        self.audio_lm_head = ParallelLMHead(
+            config.audio_num_codebooks * self.audio_codebook_size,
+            config.text_config.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+        )
 
         if get_pp_group().is_last_rank:
             self.audio_decoder_proj = HiggsAudioDecoderProjector(vllm_config)
@@ -1157,6 +1178,9 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
             self.logits_processor = LogitsProcessor(
                 config.text_config.vocab_size, config.text_config.vocab_size,
                 logit_scale)
+            self.audio_logits_processor = LogitsProcessor(
+                self.audio_lm_head.num_embeddings_padded,
+                self.audio_lm_head.org_vocab_size, logit_scale)
             self.sampler = get_sampler()
 
     def _validate_and_reshape_mm_tensor(
@@ -1196,21 +1220,29 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         audio_features = kwargs.pop("audio_features", None)
         audio_feature_attention_mask = kwargs.pop(
             "audio_feature_attention_mask", None)
-        if audio_features is None:
+        audio_out_ids = kwargs.pop("audio_out_ids", None)
+        if audio_features is None and audio_out_ids is None:
             return None
-        audio_features = self._validate_and_reshape_mm_tensor(
-            audio_features, "audio_features")
-        audio_feature_attention_mask = self._validate_and_reshape_mm_tensor(
-            audio_feature_attention_mask,
-            "audio_feature_attention_mask",
-            pad_with=0,
-        )
-        if not isinstance(audio_features, (torch.Tensor, list)):
-            raise ValueError("Incorrect type of audio input features. "
-                             f"Got type: {type(audio_features)}")
+        if audio_features is not None:
+            audio_features = self._validate_and_reshape_mm_tensor(
+                audio_features, "audio_features")
+            audio_feature_attention_mask = self._validate_and_reshape_mm_tensor(
+                audio_feature_attention_mask,
+                "audio_feature_attention_mask",
+                pad_with=0,
+            )
+            if not isinstance(audio_features, (torch.Tensor, list)):
+                raise ValueError("Incorrect type of audio input features. "
+                                 f"Got type: {type(audio_features)}")
+        if audio_out_ids is not None:
+            audio_out_ids = self._validate_and_reshape_mm_tensor(
+                audio_out_ids, "audio_out_ids")
+
         return HiggsAudioInputs(
             audio_features=audio_features,
-            audio_feature_attention_mask=audio_feature_attention_mask)
+            audio_feature_attention_mask=audio_feature_attention_mask,
+            audio_out_ids=audio_out_ids,
+        )
 
     def _process_audio_input(self,
                              audio_input: HiggsAudioInputs) -> torch.Tensor:
@@ -1263,11 +1295,44 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         return torch.split(masked_audio_features,
                            audio_feat_out_lengths.flatten().tolist())
 
+    def _embed_audio_ids(self, audio_ids):
+        """Embed the audio ids
+
+        Args:
+            audio_ids: torch.LongTensor of shape (num_reqs, num_codebooks, audio_in_total_length)
+
+        Returns:
+            audio_embed: torch.LongTensor of shape (num_reqs, audio_in_total_length, hidden_size)
+        """
+        codebook_shift = (
+            torch.arange(self.audio_num_codebooks, device=audio_ids.device) *
+            self.audio_codebook_size)
+        codebook_shift = codebook_shift.unsqueeze(0).expand(
+            audio_ids.shape[0], -1).unsqueeze(-1)
+        audio_embed = self.audio_codebook_embeddings(audio_ids +
+                                                     codebook_shift)
+        audio_embed = torch.sum(audio_embed, dim=1)
+        if self.config.use_audio_out_embed_projector:
+            audio_embed = self.audio_out_embed_projector(audio_embed)
+        return audio_embed
+
     def get_multimodal_embeddings(self, **kwargs) -> Optional[NestedTensors]:
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         if audio_input is None:
             return None
-        masked_audio_features = self._process_audio_input(audio_input)
+        if audio_input["audio_features"] is not None:
+            masked_audio_features = self._process_audio_input(audio_input)
+        else:
+            masked_audio_features = None
+        if kwargs.get("audio_out_ids", None) is not None:
+            audio_out_embeddings = self._embed_audio_ids(
+                kwargs["audio_out_ids"].unsqueeze(-1))
+            if masked_audio_features is not None:
+                masked_audio_features = torch.cat(
+                    [masked_audio_features, audio_out_embeddings], dim=1)
+            else:
+                masked_audio_features = audio_out_embeddings
+
         return masked_audio_features
 
     def get_input_embeddings(
@@ -1276,10 +1341,55 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
+        found_audio_out_bos = False
+        if self.generate_audio_out_token:
+            # Find all the position in input_ids that has single audio_out_token_idx,
+            # and set the embedding of the audio_out_token_idx to 0.
+            audio_out_token_idx = self.config.audio_out_token_idx
+            audio_out_bos_token_idx = self.config.audio_out_bos_token_idx
+
+            # Create a mask for positions where the token is audio_out_token_idx
+            audio_out_token_idx_mask = input_ids == audio_out_token_idx
+
+            # Create a mask for positions where the previous token is audio_stream_bos_id
+            # First, create a shifted version of input_ids where each position contains previous token
+            # Use padding for the first position
+            prev_tokens = torch.cat([
+                torch.full(
+                    (1, ), -1, dtype=input_ids.dtype, device=input_ids.device),
+                input_ids[:-1]
+            ],
+                                    dim=0)
+
+            # Create a mask for positions where the previous token is audio_stream_bos_id
+            prev_is_audio_bos_mask = prev_tokens == audio_out_bos_token_idx
+
+            # Combine the two masks to get positions where current token is audio_out_token_idx
+            # and previous token is audio_stream_bos_id
+            combined_mask = audio_out_token_idx_mask & prev_is_audio_bos_mask
+
+            audio_out_start_token = \
+                torch.full((1, self.audio_num_codebooks, 1), self.config.audio_stream_bos_id, dtype=torch.long, device=input_ids.device)
+
+            # Only set embeddings for positions that match both conditions
+            if combined_mask.any():
+                inputs_embeds[combined_mask, :] = \
+                    self._embed_audio_ids(audio_out_start_token[0][0])
+                input_ids[combined_mask] = -1
+                found_audio_out_bos = True
+
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
-                self.config.audio_in_token_idx)
+                input_ids, inputs_embeds, multimodal_embeddings, [
+                    self.config.audio_in_token_idx,
+                    self.config.audio_out_token_idx
+                ])
+
+        if self.generate_audio_out_token:
+            # Revert the input_ids to the original input_ids
+            if found_audio_out_bos:
+                input_ids[combined_mask] = self.config.audio_out_token_idx
+
         return inputs_embeds
 
     def forward(
@@ -1328,25 +1438,62 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
-        if self.use_audio_out:
-            hidden_states = self.audio_decoder_proj(hidden_states)
+
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        lm_head = self.audio_lm_head if self.use_audio_out \
-                    else self.text_lm_head
-        logits = self.logits_processor(lm_head, hidden_states,
-                                       sampling_metadata)
-        return logits
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        text_logits = self.logits_processor(self.text_lm_head, hidden_states,
+                                            sampling_metadata)
+        if self.generate_audio_out_token:
+            audio_logits = self.audio_logits_processor(self.audio_lm_head,
+                                                       hidden_states,
+                                                       sampling_metadata)
+            audio_logits = audio_logits.view(-1, self.audio_num_codebooks,
+                                             self.audio_codebook_size).float()
+        else:
+            audio_logits = None
+        return text_logits, audio_logits
 
     def sample(self, logits: torch.Tensor,
                sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+        if isinstance(logits, tuple):
+            logits, audio_logits = logits
+        else:
+            audio_logits = None
         next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        next_mm_tokens = None
+        if self.generate_audio_out_token:
+            assert audio_logits is not None
+            audio_logits = audio_logits.reshape(-1, self.audio_codebook_size)
+            mm_sampling_metadata = \
+                self.prepare_mm_sampling_metadata(sampling_metadata)
+            next_mm_tokens = self.sampler(audio_logits, mm_sampling_metadata)
+            next_mm_tokens.sampled_token_ids = \
+                next_mm_tokens.sampled_token_ids.reshape(
+                    -1, self.audio_num_codebooks)
+
+            # HACK: Force the next text token to be the <|AUDIO_OUT|>.
+            next_tokens.sampled_token_ids = \
+                torch.full_like(next_tokens.sampled_token_ids, self.config.audio_out_token_idx)
+        return next_tokens, next_mm_tokens
+
+    def prepare_mm_sampling_metadata(
+            self, sampling_metadata: SamplingMetadata) -> SamplingMetadata:
+        mm_sampling_metadata = copy.copy(sampling_metadata)
+        if sampling_metadata.top_k is not None:
+            mm_sampling_metadata.top_k = \
+                sampling_metadata.top_k.clip(max=self.audio_codebook_size).repeat_interleave(self.audio_num_codebooks)
+        if sampling_metadata.top_p is not None:
+            mm_sampling_metadata.top_p = \
+                sampling_metadata.top_p.repeat_interleave(self.audio_num_codebooks)
+        if sampling_metadata.temperature is not None:
+            mm_sampling_metadata.temperature = \
+                sampling_metadata.temperature.repeat_interleave(self.audio_num_codebooks)
+        return mm_sampling_metadata
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
@@ -1369,9 +1516,6 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 ]
                 if any(p in name for p in audio_param_names):
                     continue
-            # Skip audio_lm_head if we are not using audio out.
-            if not self.use_audio_out and "audio_lm_head" in name:
-                continue
             for key_to_modify, new_key in _KEYS_TO_MODIFY_MAPPING.items():
                 if key_to_modify in name:
                     name = name.replace(key_to_modify, new_key)

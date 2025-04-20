@@ -43,6 +43,7 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
+        self.model_config = model_config
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         self.lora_config = lora_config
@@ -186,6 +187,13 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 new_encoder_budget = encoder_budget
 
+            if request.output_mm_token_ids:
+                # HACK: This is a hack to use -1 as the
+                # input id for the mm token id.
+                if encoder_inputs_to_schedule is None:
+                    encoder_inputs_to_schedule = [-1]
+                else:
+                    encoder_inputs_to_schedule.append(-1)
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request, num_new_tokens)
@@ -247,6 +255,8 @@ class Scheduler(SchedulerInterface):
                     encoder_inputs_to_schedule)
                 # Allocate the encoder cache.
                 for i in encoder_inputs_to_schedule:
+                    if i == -1:
+                        continue
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_budget = new_encoder_budget
 
@@ -463,12 +473,17 @@ class Scheduler(SchedulerInterface):
         num_regular_tokens = num_scheduled_tokens - num_scheduled_spec_tokens
         new_token_ids = request.all_token_ids[
             num_computed_tokens:num_computed_tokens + num_regular_tokens]
+        if request.output_mm_token_ids:
+            new_mm_token_ids = request.output_mm_token_ids[-1]
+        else:
+            new_mm_token_ids = None
         req_data = self._cached_reqs_data.get(request.request_id)
         if req_data is not None:
             req_data.resumed_from_preemption = resumed_from_preemption
             req_data.new_token_ids = new_token_ids
             req_data.new_block_ids = new_block_ids
             req_data.num_computed_tokens = num_computed_tokens
+            req_data.new_mm_token_ids = new_mm_token_ids
         else:
             req_data = CachedRequestData.from_request(request,
                                                       resumed_from_preemption,
@@ -626,6 +641,22 @@ class Scheduler(SchedulerInterface):
                     del new_token_ids[num_new:]  # Trim new tokens if needed.
                     break
 
+            if model_runner_output.sampled_mm_token_ids is not None:
+                new_mm_token_ids = model_runner_output.sampled_mm_token_ids[
+                    req_index]
+                # Append the generated mm tokens to the request and
+                # check for stop
+                request.append_output_mm_token_ids(
+                    new_mm_token_ids,
+                    self.model_config.hf_config.audio_stream_bos_id,
+                    self.model_config.hf_config.audio_stream_eos_id)
+                if not stopped:
+                    stopped = check_stop(request, self.max_model_len)
+                    if stopped:
+                        self._free_request(request)
+            else:
+                new_mm_token_ids = None
+
             # Extract sample logprobs if needed.
             if request.sampling_params.logprobs is not None and logprobs:
                 # NOTE: once we support N tokens per step (spec decode),
@@ -647,6 +678,7 @@ class Scheduler(SchedulerInterface):
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
+                        new_mm_token_ids=new_mm_token_ids,
                         finish_reason=request.get_finished_reason(),
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,

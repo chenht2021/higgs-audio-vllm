@@ -1,0 +1,4 @@
+
+[submodule "third_party/xcodec"]
+	path = third_party/xcodec
+	url = https://github.com/boson-ai/xcodec.git

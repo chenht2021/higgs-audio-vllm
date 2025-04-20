@@ -24,6 +24,7 @@ class CompletionOutput:
         index: The index of the output in the request.
         text: The generated output text.
         token_ids: The token IDs of the generated output text.
+        mm_token_ids: The token IDs of the generated multi-modal output.
         cumulative_logprob: The cumulative log probability of the generated
             output text.
         logprobs: The log probabilities of the top probability words at each
@@ -40,6 +41,7 @@ class CompletionOutput:
     token_ids: GenericSequence[int]
     cumulative_logprob: Optional[float]
     logprobs: Optional[SampleLogprobs]
+    mm_token_ids: Optional[GenericSequence[GenericSequence[int]]] = None
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
@@ -51,6 +53,7 @@ class CompletionOutput:
         return (f"CompletionOutput(index={self.index}, "
                 f"text={self.text!r}, "
                 f"token_ids={self.token_ids}, "
+                f"mm_token_ids={self.mm_token_ids}, "
                 f"cumulative_logprob={self.cumulative_logprob}, "
                 f"logprobs={self.logprobs}, "
                 f"finish_reason={self.finish_reason}, "
@@ -267,12 +270,14 @@ class RequestOutput:
 
             else:
                 output = CompletionOutput(
-                    top_n_seqs.index(seq), output_text, [output_token_ids]
-                    if isinstance(output_token_ids, int) else output_token_ids,
+                    top_n_seqs.index(seq),
+                    output_text, [output_token_ids] if isinstance(
+                        output_token_ids, int) else output_token_ids,
                     seq.get_cumulative_logprob() if include_logprobs else None,
                     output_logprobs,
                     SequenceStatus.get_finished_reason(seq.status),
-                    seq.stop_reason)
+                    seq.stop_reason,
+                    mm_token_ids=None)
 
             outputs.append(output)
 

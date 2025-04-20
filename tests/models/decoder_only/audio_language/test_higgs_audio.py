@@ -2,8 +2,19 @@
 # ruff: noqa
 import base64
 import os
+import re
+from typing import Any
+
+import librosa
+import numpy as np
+import pytest
+import soundfile as sf
+import torch
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 from vllm import LLM, SamplingParams
+from vllm.model_executor.models.higgs_audio_tokenizer import (
+    AudioTokenizer, revert_delay_pattern)
 
 TEXT_OUT_CHAT_TEMPLATE = (
     "{% set loop_messages = messages %}"
@@ -30,10 +41,61 @@ AUDIO_OUT_CHAT_TEMPLATE = (
     "{{ content }}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
-    "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|>' }}"
+    "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|><|AUDIO_OUT|>' }}"
     "{% endif %}")
 
 TEST_MODEL_PATH = "/fsx/models/higgs_audio_test_models"
+
+
+@pytest.fixture(scope="module")
+def speech_samples():
+    with open("speech_samples.txt", "r") as f:
+        return [line.strip() for line in f.readlines()]
+
+
+def prepare_zero_shot_conversation(text: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "system",
+            "content": "Convert the following text from the user into speech."
+        },
+        {
+            "role": "user",
+            "content": text,
+        },
+    ]
+
+
+@pytest.fixture(scope="module")
+def asr_pipeline():
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    model_id = "openai/whisper-large-v3-turbo"
+
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id,
+                                                      torch_dtype=torch_dtype,
+                                                      low_cpu_mem_usage=True,
+                                                      use_safetensors=True)
+    model.to(device)
+
+    processor = AutoProcessor.from_pretrained(model_id)
+
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        torch_dtype=torch_dtype,
+        device=device,
+    )
+    return pipe
+
+
+def _get_asr(wv, sr, pipe):
+    data = librosa.resample(wv, orig_sr=sr, target_sr=16000)
+    result = pipe(data)
+    return result['text'].strip()
 
 
 def encode_base64_content_from_file(file_path: str) -> str:
@@ -44,32 +106,42 @@ def encode_base64_content_from_file(file_path: str) -> str:
     return audio_base64
 
 
-def test_text_in_audio_out():
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_out_3b_20241222")
-    llm = LLM(model=model_path)
-    sampling_params = SamplingParams(temperature=0,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"])
-    conversation = [
-        {
-            "role":
-            "system",
-            "content":
-            "You need to generate audio that matches the given speaker description. "
-            "You are a young girl. You should sound excited and speak in normal speed. "
-            "The user will now give you text, convert the following user texts to speech.",
-        },
-        {
-            "role": "user",
-            "content": "Mr. Bounce was very small and like a rubber ball.",
-        },
+def clean_punctuation(s):
+    return re.sub(r'[^\w\s]', '', s)
+
+
+def test_text_in_audio_out_zero_shot(speech_samples, asr_pipeline):
+    batch_size = 5
+    conversations = [
+        prepare_zero_shot_conversation(speech_samples[i])
+        for i in range(batch_size)
     ]
+    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+    llm = LLM(model=model_path, max_model_len=1024)
+    sampling_params = SamplingParams(temperature=0.7,
+                                     max_tokens=500,
+                                     stop=["<|eot_id|>", "<|end_of_text|>"])
+
     outputs = llm.chat(
-        conversation,
+        conversations,
         sampling_params=sampling_params,
         use_tqdm=False,
         chat_template=AUDIO_OUT_CHAT_TEMPLATE,
     )
-    print(outputs)
+
+    audio_tokenizer = AudioTokenizer(
+        "xcodec_tps25_0215",
+        downloaded_model_path=
+        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+    for i in range(len(outputs)):
+        audio_out_ids = \
+            np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
+        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
+        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
+        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
+        # sf.write(f"audio_out_{i}.wav", decoded_audio, sr)
+        assert clean_punctuation(
+            speech_samples[i]).lower() == clean_punctuation(asr_text).lower()
 
 
 def test_audio_in_text_out():

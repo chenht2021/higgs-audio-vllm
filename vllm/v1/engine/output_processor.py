@@ -140,6 +140,7 @@ class RequestState:
         new_token_ids: list[int],
         finish_reason: Optional[FinishReason],
         stop_reason: Union[int, str, None],
+        new_mm_token_ids: Optional[list[int]] = None,
     ) -> Optional[RequestOutput]:
 
         finished = finish_reason is not None
@@ -150,7 +151,7 @@ class RequestState:
             return None
 
         completion_output = self._new_completion_output(
-            new_token_ids, finish_reason, stop_reason)
+            new_token_ids, finish_reason, stop_reason, new_mm_token_ids)
 
         request_id = self.request_id
         if self.parent_req is None:
@@ -190,6 +191,7 @@ class RequestState:
         token_ids: list[int],
         finish_reason: Optional[FinishReason],
         stop_reason: Union[int, str, None],
+        new_mm_token_ids: Optional[list[int]] = None,
     ) -> CompletionOutput:
 
         finished = finish_reason is not None
@@ -199,7 +201,9 @@ class RequestState:
         text = self.detokenizer.get_next_output_text(finished, delta)
         if not delta:
             token_ids = self.detokenizer.output_token_ids
-
+            mm_token_ids = self.detokenizer.output_mm_token_ids
+        elif new_mm_token_ids is not None:
+            mm_token_ids = [new_mm_token_ids]
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
         if delta and logprobs:
@@ -209,6 +213,7 @@ class RequestState:
             index=self.request_index,
             text=text,
             token_ids=token_ids,
+            mm_token_ids=mm_token_ids,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -322,12 +327,13 @@ class OutputProcessor:
             new_token_ids = engine_core_output.new_token_ids
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
-
+            new_mm_token_ids = engine_core_output.new_mm_token_ids
             req_state.is_prefilling = False
 
             # 2) Detokenize the token ids into text and perform stop checks.
             stop_string = req_state.detokenizer.update(
-                new_token_ids, finish_reason == FinishReason.STOP)
+                new_token_ids, finish_reason == FinishReason.STOP,
+                new_mm_token_ids)
             if stop_string:
                 finish_reason = FinishReason.STOP
                 stop_reason = stop_string
@@ -337,7 +343,8 @@ class OutputProcessor:
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
-                    new_token_ids, finish_reason, stop_reason):
+                    new_token_ids, finish_reason, stop_reason,
+                    new_mm_token_ids):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
