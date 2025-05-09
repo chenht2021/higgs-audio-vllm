@@ -12,7 +12,8 @@ from typing import Any, List, Optional, Set, Tuple, TypedDict, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, BatchFeature, ProcessorMixin
+from transformers import (AutoConfig, AutoFeatureExtractor, BatchFeature,
+                          ProcessorMixin)
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.whisper import WhisperFeatureExtractor
 from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
@@ -52,6 +53,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.sequence import IntermediateTensors
 
 from .higgs_audio_config import HiggsAudioConfig, HiggsAudioEncoderConfig
+from .higgs_audio_tokenizer import AudioTokenizer
 
 logger = init_logger(__name__)
 
@@ -62,9 +64,7 @@ _KEYS_TO_MODIFY_MAPPING = {
 
 AutoConfig.register("higgs_audio_encoder", HiggsAudioEncoderConfig)
 AutoConfig.register("higgs_audio", HiggsAudioConfig)
-
-HIGGS_AUDIO_TOKENIZER = os.getenv("HIGGS_AUDIO_TOKENIZER",
-                                  "openai/whisper-large-v3-turbo")
+AutoFeatureExtractor.register(HiggsAudioConfig, AudioTokenizer)
 
 
 # # === Audio Inputs === #
@@ -77,6 +77,38 @@ class HiggsAudioInputs(TypedDict):
 
     # (num_audios, num_codebooks)
     audio_out_ids: torch.Tensor
+
+
+def _validate_and_reshape_mm_tensor(
+    mm_input: object,
+    name: str,
+    pad_with: Optional[int] = None,
+) -> torch.Tensor:
+    if not isinstance(mm_input, (torch.Tensor, list)):
+        raise ValueError(f"Incorrect type of {name}. "
+                         f"Got type: {type(mm_input)}")
+    if isinstance(mm_input, torch.Tensor):
+        return torch.concat(list(mm_input))
+    else:
+        if pad_with is not None:
+            max_size = max([tensor.size(-1) for tensor in mm_input
+                            ])  # Find max size along the last dimension
+            # Step 2: Pad each tensor to the max size along the last
+            # dimension
+            padded_tensors = []
+            for tensor in mm_input:
+                pad_size = max_size - tensor.size(
+                    -1)  # Calculate how much padding is needed
+                if pad_size > 0:
+                    # Pad tensor along the last dimension (right side)
+                    padded_tensor = torch.nn.functional.pad(
+                        tensor, (0, pad_size))
+                else:
+                    padded_tensor = tensor
+                padded_tensors.append(padded_tensor)
+            return torch.concat(padded_tensors)
+        else:
+            return torch.concat(mm_input)
 
 
 # Revised on top of transformers.models.qwen2_audio.modeling_qwen2_audio
@@ -418,7 +450,10 @@ def get_processor(
     # it will call torch.cuda.device_count()
     from transformers import AutoFeatureExtractor
 
-    try:
+    HIGGS_AUDIO_TOKENIZER = os.getenv("HIGGS_AUDIO_TOKENIZER",
+                                      "openai/whisper-large-v3-turbo")
+
+    if HIGGS_AUDIO_TOKENIZER == "openai/whisper-large-v3-turbo":
         feature_extractor = AutoFeatureExtractor.from_pretrained(
             HIGGS_AUDIO_TOKENIZER,  # TODO: Write into config file
             *args,
@@ -426,25 +461,25 @@ def get_processor(
             attn_implementation="sdpa",
             **kwargs,
         )
-        processor = HFHiggsAudioProcessor(
-            feature_extractor=feature_extractor,
-            tokenizer=tokenzier,
+    else:
+        HIGGS_AUDIO_TOKENIZER_PATH = os.environ.get(
+            "HIGGS_AUDIO_TOKENIZER_PATH",
+            None,
         )
-        logger.info("Loaded HFHiggsAudioProcessor")
-    except ValueError as e:
-        # If the error pertains to the processor class not existing or not
-        # currently being imported, suggest using the --trust-remote-code flag.
-        # Unlike AutoTokenizer, AutoProcessor does not separate such errors
-        if not trust_remote_code:
-            err_msg = (
-                "Failed to load the processor. If the processor is "
-                "a custom processor not yet available in the HuggingFace "
-                "transformers library, consider setting "
-                "`trust_remote_code=True` in LLM or using the "
-                "`--trust-remote-code` flag in the CLI.")
-            raise RuntimeError(err_msg) from e
-        else:
-            raise e
+        assert HIGGS_AUDIO_TOKENIZER_PATH is not None, (
+            "HIGGS_AUDIO_TOKENIZER_PATH is not set. Please set the "
+            "environment variable HIGGS_AUDIO_TOKENIZER_PATH to the path "
+            "of the tokenizer checkpoint to use.")
+        feature_extractor = AudioTokenizer(
+            model=HIGGS_AUDIO_TOKENIZER,
+            device="cuda",
+            downloaded_model_path=HIGGS_AUDIO_TOKENIZER_PATH,
+        )
+    processor = HFHiggsAudioProcessor(
+        feature_extractor=feature_extractor,
+        tokenizer=tokenzier,
+    )
+    logger.info("Loaded HFHiggsAudioProcessor")
 
     return processor
 
@@ -469,7 +504,6 @@ class HFHiggsAudioProcessor(ProcessorMixin):
     """
 
     attributes = ["feature_extractor", "tokenizer"]
-    feature_extractor_class = "WhisperFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
 
     def __init__(
@@ -489,6 +523,10 @@ class HFHiggsAudioProcessor(ProcessorMixin):
             tokenizer, "audio_bos_token") else audio_bos_token)
         self.audio_eos_token = (tokenizer.audio_eos_token if hasattr(
             tokenizer, "audio_eos_token") else audio_eos_token)
+
+        # HACK: Workaround the class check in the base class
+        if feature_extractor is not None:
+            self.feature_extractor_class = feature_extractor.__class__.__name__
         super().__init__(feature_extractor,
                          tokenizer,
                          chat_template=chat_template)
@@ -564,29 +602,59 @@ class HFHiggsAudioProcessor(ProcessorMixin):
                     f"{'s' if num_audio_tokens > 1 else ''} "
                     f"in provided text but received {num_audios} audio"
                     f"{'s' if num_audios > 1 else ''}")
-
             # Some kwargs should not be changed so we can expand text with audio tokens below
-            audio_inputs = self.feature_extractor(
-                audio,
-                sampling_rate=sampling_rate,
-                return_attention_mask=True,
-                padding="max_length",
-                **kwargs,
-            )
-            # Rename to audio_feature_attention_mask to prevent conflicts
-            # with text attention mask
-            audio_inputs["audio_feature_attention_mask"] = audio_inputs.pop(
-                "attention_mask")
-            expanded_text = []
-            audio_lengths = audio_inputs["audio_feature_attention_mask"].sum(
-                -1).tolist()
+            use_whisper = False
+            if hasattr(self.feature_extractor, "encode"):
+                if isinstance(audio, np.ndarray):
+                    audio = [audio]
+                audio = [a.astype(np.float32) for a in audio]
+                audio_ids = [
+                    self.feature_extractor.encode(
+                        a, self.feature_extractor.sampling_rate).unsqueeze(0)
+                    for a in audio
+                ]
+                audio_lengths = [a.shape[-1] for a in audio_ids]
+                audio_in_ids_length = torch.tensor(audio_lengths)
+                audio_in_ids = _validate_and_reshape_mm_tensor(audio_ids,
+                                                               "audio_in_ids",
+                                                               pad_with=0)
+                audio_feature_attention_mask = torch.arange(
+                    audio_in_ids.shape[-1]).expand(
+                        audio_in_ids.shape[0], audio_in_ids.shape[-1]).to(
+                            audio_in_ids_length.device
+                        ) < audio_in_ids_length.unsqueeze(-1)
+                audio_inputs = {
+                    "input_features": audio_in_ids,
+                    "audio_feature_attention_mask":
+                    audio_feature_attention_mask,
+                }
+            else:
+                use_whisper = True
+                audio_inputs = self.feature_extractor(
+                    audio,
+                    sampling_rate=sampling_rate,
+                    return_attention_mask=True,
+                    padding="max_length",
+                    **kwargs,
+                )
+                # Rename to audio_feature_attention_mask to prevent conflicts
+                # with text attention mask
+                audio_inputs[
+                    "audio_feature_attention_mask"] = audio_inputs.pop(
+                        "attention_mask")
+                audio_lengths = audio_inputs[
+                    "audio_feature_attention_mask"].sum(-1).tolist()
 
+            expanded_text = []
             for sample in text:
                 replace_str = []
                 while self.audio_token in sample:
-                    audio_length = audio_lengths.pop(0)
-                    input_length = (audio_length - 1) // 2 + 1
-                    num_audio_tokens = (input_length - 2) // 2 + 1
+                    if use_whisper:
+                        audio_length = audio_lengths.pop(0)
+                        input_length = (audio_length - 1) // 2 + 1
+                        num_audio_tokens = (input_length - 2) // 2 + 1
+                    else:
+                        num_audio_tokens = audio_lengths.pop(0)
 
                     expanded_audio_token = self.audio_token * num_audio_tokens
 
@@ -655,6 +723,9 @@ class HFHiggsAudioProcessor(ProcessorMixin):
         # fmt: on
 
 
+HiggsAudioFeatureExtractor = Union[AudioTokenizer, WhisperFeatureExtractor]
+
+
 class HiggsAudioProcessingInfo(BaseProcessingInfo):
 
     def get_hf_config(self):
@@ -674,10 +745,9 @@ class HiggsAudioProcessingInfo(BaseProcessingInfo):
         *,
         # Ignored in initialization
         sampling_rate: Optional[int] = None,
-    ) -> WhisperFeatureExtractor:
+    ) -> HiggsAudioFeatureExtractor:
         hf_processor = self.get_hf_processor(sampling_rate=sampling_rate)
         feature_extractor = hf_processor.feature_extractor  # type: ignore
-        assert isinstance(feature_extractor, WhisperFeatureExtractor)
         return feature_extractor
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
@@ -697,6 +767,12 @@ class HiggsAudioProcessingInfo(BaseProcessingInfo):
 
 class HiggsAudioMultiModalProcessor(
         BaseMultiModalProcessor[HiggsAudioProcessingInfo]):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.audio_tokenizer_type = os.getenv("HIGGS_AUDIO_TOKENIZER",
+                                              "openai/whisper-large-v3-turbo")
+        self.use_whisper_tokenizer = self.audio_tokenizer_type == "openai/whisper-large-v3-turbo"
 
     def _get_data_parser(self) -> MultiModalDataParser:
         return MultiModalDataParser(
@@ -769,9 +845,12 @@ class HiggsAudioMultiModalProcessor(
             audio_output_lengths = []
         else:
             assert isinstance(audio_feature_attention_mask, torch.Tensor)
-            _, audio_output_lens = _get_feat_extract_output_lengths(
-                audio_feature_attention_mask.sum(-1))
 
+            if self.use_whisper_tokenizer:
+                _, audio_output_lens = _get_feat_extract_output_lengths(
+                    audio_feature_attention_mask.sum(-1))
+            else:
+                audio_output_lens = audio_feature_attention_mask.sum(-1)
             audio_output_lengths = audio_output_lens.tolist()
 
         def get_replacement_higgs_audio(item_idx: int):
@@ -810,7 +889,11 @@ class HiggsAudioDummyInputsBuilder(
         feature_extractor = self.info.get_feature_extractor()
 
         sampling_rate = feature_extractor.sampling_rate
-        audio_len = feature_extractor.chunk_length * sampling_rate
+        if hasattr(feature_extractor, "chunk_length"):
+            audio_len = feature_extractor.chunk_length * sampling_rate
+        else:
+            # Default to 30 seconds audio
+            audio_len = 30 * sampling_rate
         num_audios = mm_counts.get("audio", 0)
 
         mm_data = {
@@ -1147,6 +1230,9 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         # FIXME: This should be fixed. We should simply reply on the token
         # history to determine if we should generate audio out tokens.
         self.generate_audio_out_token = config.skip_audio_tower
+        self.audio_tokenizer_type = os.getenv("HIGGS_AUDIO_TOKENIZER",
+                                              "openai/whisper-large-v3-turbo")
+        self.use_whisper_tokenizer = self.audio_tokenizer_type == "openai/whisper-large-v3-turbo"
 
         if config.use_audio_out_embed_projector:
             self.audio_out_embed_projector = nn.Linear(
@@ -1183,38 +1269,6 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 self.audio_lm_head.org_vocab_size, logit_scale)
             self.sampler = get_sampler()
 
-    def _validate_and_reshape_mm_tensor(
-        self,
-        mm_input: object,
-        name: str,
-        pad_with: Optional[int] = None,
-    ) -> torch.Tensor:
-        if not isinstance(mm_input, (torch.Tensor, list)):
-            raise ValueError(f"Incorrect type of {name}. "
-                             f"Got type: {type(mm_input)}")
-        if isinstance(mm_input, torch.Tensor):
-            return torch.concat(list(mm_input))
-        else:
-            if pad_with is not None:
-                max_size = max([tensor.size(-1) for tensor in mm_input
-                                ])  # Find max size along the last dimension
-                # Step 2: Pad each tensor to the max size along the last
-                # dimension
-                padded_tensors = []
-                for tensor in mm_input:
-                    pad_size = max_size - tensor.size(
-                        -1)  # Calculate how much padding is needed
-                    if pad_size > 0:
-                        # Pad tensor along the last dimension (right side)
-                        padded_tensor = torch.nn.functional.pad(
-                            tensor, (0, pad_size))
-                    else:
-                        padded_tensor = tensor
-                    padded_tensors.append(padded_tensor)
-                return torch.concat(padded_tensors)
-            else:
-                return torch.concat(mm_input)
-
     def _parse_and_validate_audio_input(
             self, **kwargs: object) -> Optional[HiggsAudioInputs]:
         audio_features = kwargs.pop("audio_features", None)
@@ -1224,9 +1278,11 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         if audio_features is None and audio_out_ids is None:
             return None
         if audio_features is not None:
-            audio_features = self._validate_and_reshape_mm_tensor(
-                audio_features, "audio_features")
-            audio_feature_attention_mask = self._validate_and_reshape_mm_tensor(
+            audio_features = _validate_and_reshape_mm_tensor(
+                audio_features,
+                "audio_features",
+                pad_with=0 if not self.use_whisper_tokenizer else None)
+            audio_feature_attention_mask = _validate_and_reshape_mm_tensor(
                 audio_feature_attention_mask,
                 "audio_feature_attention_mask",
                 pad_with=0,
@@ -1235,21 +1291,20 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 raise ValueError("Incorrect type of audio input features. "
                                  f"Got type: {type(audio_features)}")
         if audio_out_ids is not None:
-            audio_out_ids = self._validate_and_reshape_mm_tensor(
+            audio_out_ids = _validate_and_reshape_mm_tensor(
                 audio_out_ids, "audio_out_ids")
-
+            # audio_out_ids_length = _validate_and_reshape_mm_tensor(
+            #     audio_out_ids_length, "audio_out_ids_length")
         return HiggsAudioInputs(
             audio_features=audio_features,
             audio_feature_attention_mask=audio_feature_attention_mask,
             audio_out_ids=audio_out_ids,
         )
 
-    def _process_audio_input(self,
-                             audio_input: HiggsAudioInputs) -> torch.Tensor:
-        audio_features = audio_input["audio_features"]
-        audio_feature_attention_mask = audio_input[
-            "audio_feature_attention_mask"]
-
+    def _process_whisper_audio_input(
+        self, audio_features: torch.Tensor,
+        audio_feature_attention_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, ...]:
         (
             audio_feat_lengths,
             audio_feat_out_lengths,
@@ -1295,23 +1350,45 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         return torch.split(masked_audio_features,
                            audio_feat_out_lengths.flatten().tolist())
 
+    def _process_audio_input(self,
+                             audio_input: HiggsAudioInputs) -> torch.Tensor:
+        audio_features = audio_input["audio_features"]
+        audio_feature_attention_mask = audio_input[
+            "audio_feature_attention_mask"]
+
+        if self.use_whisper_tokenizer:
+            return self._process_whisper_audio_input(
+                audio_features, audio_feature_attention_mask)
+
+        audio_features_flattened = audio_features.transpose(1, 0).reshape(
+            audio_features.shape[1], -1)
+        audio_features_embeddings = self._embed_audio_ids(
+            audio_features_flattened)
+        audio_features_attention_mask_flattened = audio_feature_attention_mask.flatten(
+        )
+        masked_audio_features_embeddings = audio_features_embeddings[
+            audio_features_attention_mask_flattened]
+        audio_features_lens = audio_feature_attention_mask.sum(-1)
+        masked_audio_features_embeddings = torch.split(
+            masked_audio_features_embeddings, audio_features_lens.tolist())
+        return masked_audio_features_embeddings
+
     def _embed_audio_ids(self, audio_ids):
         """Embed the audio ids
 
         Args:
-            audio_ids: torch.LongTensor of shape (num_reqs, num_codebooks, audio_in_total_length)
+            audio_ids: torch.LongTensor of shape (num_codebooks, audio_in_total_length)
 
         Returns:
-            audio_embed: torch.LongTensor of shape (num_reqs, audio_in_total_length, hidden_size)
+            audio_embed: torch.LongTensor of shape (audio_in_total_length, hidden_size)
         """
         codebook_shift = (
             torch.arange(self.audio_num_codebooks, device=audio_ids.device) *
             self.audio_codebook_size)
-        codebook_shift = codebook_shift.unsqueeze(0).expand(
-            audio_ids.shape[0], -1).unsqueeze(-1)
+        codebook_shift = codebook_shift.unsqueeze(-1)
         audio_embed = self.audio_codebook_embeddings(audio_ids +
                                                      codebook_shift)
-        audio_embed = torch.sum(audio_embed, dim=1)
+        audio_embed = torch.sum(audio_embed, dim=0)
         if self.config.use_audio_out_embed_projector:
             audio_embed = self.audio_out_embed_projector(audio_embed)
         return audio_embed
@@ -1325,11 +1402,14 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         else:
             masked_audio_features = None
         if kwargs.get("audio_out_ids", None) is not None:
-            audio_out_embeddings = self._embed_audio_ids(
-                kwargs["audio_out_ids"].unsqueeze(-1))
+            audio_out_ids = kwargs["audio_out_ids"]
+            audio_out_flattened = audio_out_ids.transpose(1, 0)
+            audio_out_embeddings = self._embed_audio_ids(audio_out_flattened)
+            audio_out_embeddings = torch.chunk(audio_out_embeddings,
+                                               audio_out_ids.shape[0],
+                                               dim=0)
             if masked_audio_features is not None:
-                masked_audio_features = torch.cat(
-                    [masked_audio_features, audio_out_embeddings], dim=1)
+                masked_audio_features.extend(audio_out_embeddings)
             else:
                 masked_audio_features = audio_out_embeddings
 
@@ -1369,21 +1449,38 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
             combined_mask = audio_out_token_idx_mask & prev_is_audio_bos_mask
 
             audio_out_start_token = \
-                torch.full((1, self.audio_num_codebooks, 1), self.config.audio_stream_bos_id, dtype=torch.long, device=input_ids.device)
+                torch.full((self.audio_num_codebooks, 1), self.config.audio_stream_bos_id, dtype=torch.long, device=input_ids.device)
 
             # Only set embeddings for positions that match both conditions
             if combined_mask.any():
                 inputs_embeds[combined_mask, :] = \
-                    self._embed_audio_ids(audio_out_start_token[0][0])
+                    self._embed_audio_ids(audio_out_start_token)
                 input_ids[combined_mask] = -1
                 found_audio_out_bos = True
 
         if multimodal_embeddings is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings, [
-                    self.config.audio_in_token_idx,
-                    self.config.audio_out_token_idx
-                ])
+            # The first N embddings is for audio in embeddings
+            # and the last M embeddings is for audio out embeddings.
+            # First count how many audio in embeddings are there.
+            is_audio_in_token = input_ids == self.config.audio_in_token_idx
+            shifted_is_audio_in_token = torch.roll(is_audio_in_token, 1)
+            shifted_is_audio_in_token[0] = False
+            new_audio_start = is_audio_in_token & ~shifted_is_audio_in_token
+            num_audio_in_embeddings = new_audio_start.sum().item()
+
+            # Merge the audio in embeddings.
+            if num_audio_in_embeddings > 0:
+                inputs_embeds = merge_multimodal_embeddings(
+                    input_ids, inputs_embeds,
+                    multimodal_embeddings[:num_audio_in_embeddings],
+                    self.config.audio_in_token_idx)
+
+            # Merge the audio out embeddings.
+            if num_audio_in_embeddings < len(multimodal_embeddings):
+                inputs_embeds = merge_multimodal_embeddings(
+                    input_ids, inputs_embeds,
+                    multimodal_embeddings[num_audio_in_embeddings:],
+                    self.config.audio_out_token_idx)
 
         if self.generate_audio_out_token:
             # Revert the input_ids to the original input_ids

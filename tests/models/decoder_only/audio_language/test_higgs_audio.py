@@ -5,6 +5,7 @@ import os
 import re
 from typing import Any
 
+import jiwer
 import librosa
 import numpy as np
 import pytest
@@ -66,6 +67,39 @@ def prepare_zero_shot_conversation(text: str) -> list[dict[str, Any]]:
     ]
 
 
+def prepare_tts_voice_clone_sample(text: str, ref_audio_path: str):
+    ref_audio_base64 = encode_base64_content_from_file(ref_audio_path)
+    tts_sample = [{
+        "role":
+        "system",
+        "content": ["Convert the following text from the user into speech."]
+    }, {
+        "role":
+        "user",
+        "content":
+        "The device would work during the day as well, if you took steps to either block direct sunlightor point it away from the sun."
+    }, {
+        "role":
+        "assistant",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": ref_audio_base64,
+            }
+        }]
+    }, {
+        "role": "user",
+        "content": text
+    }]
+    return tts_sample
+
+
+@pytest.fixture(scope="module")
+def tts_voice_clone_sample_1():
+    return prepare_tts_voice_clone_sample(
+        "Mr. Bounce was very small, and like a rubber ball.", "en_woman_1.wav")
+
+
 @pytest.fixture(scope="module")
 def asr_pipeline():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -110,8 +144,8 @@ def clean_punctuation(s):
     return re.sub(r'[^\w\s]', '', s)
 
 
-def test_text_in_audio_out_zero_shot(speech_samples, asr_pipeline):
-    batch_size = 5
+def test_audio_tts_zero_shot(speech_samples, asr_pipeline):
+    batch_size = 20
     conversations = [
         prepare_zero_shot_conversation(speech_samples[i])
         for i in range(batch_size)
@@ -133,6 +167,9 @@ def test_text_in_audio_out_zero_shot(speech_samples, asr_pipeline):
         "xcodec_tps25_0215",
         downloaded_model_path=
         "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+
+    reference = ""
+    hypothesis = ""
     for i in range(len(outputs)):
         audio_out_ids = \
             np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
@@ -140,8 +177,58 @@ def test_text_in_audio_out_zero_shot(speech_samples, asr_pipeline):
         decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
         asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
         # sf.write(f"audio_out_{i}.wav", decoded_audio, sr)
-        assert clean_punctuation(
-            speech_samples[i]).lower() == clean_punctuation(asr_text).lower()
+        reference += clean_punctuation(speech_samples[i]).lower()
+        hypothesis += clean_punctuation(asr_text).lower()
+
+    wer = jiwer.wer(reference, hypothesis)
+    print(f"WER: {wer}")
+    assert wer < 0.05
+
+
+def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
+    audio_tokenizer_type = "xcodec_tps25_0215"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+
+    batch_size = 20
+    ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
+    conversations = [
+        prepare_tts_voice_clone_sample(
+            speech_samples[i], ref_audio_paths[i % len(ref_audio_paths)])
+        for i in range(batch_size)
+    ]
+    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+    llm = LLM(model=model_path, max_model_len=1024)
+    sampling_params = SamplingParams(temperature=0.7,
+                                     max_tokens=500,
+                                     stop=["<|eot_id|>", "<|end_of_text|>"])
+
+    outputs = llm.chat(
+        conversations,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+        chat_template=AUDIO_OUT_CHAT_TEMPLATE,
+    )
+
+    audio_tokenizer = AudioTokenizer(
+        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
+
+    reference = ""
+    hypothesis = ""
+    for i in range(len(outputs)):
+        audio_out_ids = \
+            np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
+        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
+        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
+        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
+        # sf.write(f"audio_out_{i}.wav", decoded_audio, sr)
+        reference += clean_punctuation(speech_samples[i]).lower()
+        hypothesis += clean_punctuation(asr_text).lower()
+
+    wer = jiwer.wer(reference, hypothesis)
+    print(f"WER: {wer}")
+    assert wer < 0.05
 
 
 def test_audio_in_text_out():

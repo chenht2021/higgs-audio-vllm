@@ -45,3 +45,6 @@ scipy # Required for phi-4-multimodal-instruct
 ninja # Required for xgrammar, rocm, tpu, xpu
 librosa
 s3fs
+omegaconf
+descript-audiotools>=0.7.2
+descript-audio-codec
