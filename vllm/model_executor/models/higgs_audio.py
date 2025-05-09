@@ -1459,28 +1459,11 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 found_audio_out_bos = True
 
         if multimodal_embeddings is not None:
-            # The first N embddings is for audio in embeddings
-            # and the last M embeddings is for audio out embeddings.
-            # First count how many audio in embeddings are there.
-            is_audio_in_token = input_ids == self.config.audio_in_token_idx
-            shifted_is_audio_in_token = torch.roll(is_audio_in_token, 1)
-            shifted_is_audio_in_token[0] = False
-            new_audio_start = is_audio_in_token & ~shifted_is_audio_in_token
-            num_audio_in_embeddings = new_audio_start.sum().item()
-
-            # Merge the audio in embeddings.
-            if num_audio_in_embeddings > 0:
-                inputs_embeds = merge_multimodal_embeddings(
-                    input_ids, inputs_embeds,
-                    multimodal_embeddings[:num_audio_in_embeddings],
-                    self.config.audio_in_token_idx)
-
-            # Merge the audio out embeddings.
-            if num_audio_in_embeddings < len(multimodal_embeddings):
-                inputs_embeds = merge_multimodal_embeddings(
-                    input_ids, inputs_embeds,
-                    multimodal_embeddings[num_audio_in_embeddings:],
-                    self.config.audio_out_token_idx)
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids, inputs_embeds, multimodal_embeddings, [
+                    self.config.audio_in_token_idx,
+                    self.config.audio_out_token_idx
+                ])
 
         if self.generate_audio_out_token:
             # Revert the input_ids to the original input_ids

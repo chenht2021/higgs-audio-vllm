@@ -232,6 +232,7 @@ def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
 
 
 def test_audio_in_text_out():
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = "openai/whisper-large-v3-turbo"
     model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_in_3b_20241222")
     llm = LLM(model=model_path, max_model_len=1024)
     audio_path = "./audiobook_sample.mp3"

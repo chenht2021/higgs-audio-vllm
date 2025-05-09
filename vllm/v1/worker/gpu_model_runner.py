@@ -843,18 +843,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Batch the multi-modal inputs.
         mm_inputs: list[MultiModalKwargs] = []
+        mm_outputs: list[MultiModalKwargs] = []
         req_input_ids: list[tuple[str, int]] = []
+        req_input_ids_for_mm_outputs: list[tuple[str, int]] = []
+
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
             for input_id in encoder_input_ids:
                 if input_id == -1:
+                    # -1 means output mm token ids
                     assert req_state.output_mm_token_ids is not None
-                    mm_inputs.append(
+                    mm_outputs.append(
                         MultiModalKwargs({
                             "audio_out_ids":
                             req_state.output_mm_token_ids[-1]
                         }))
-                    req_input_ids.append((req_id, input_id))
+                    req_input_ids_for_mm_outputs.append((req_id, input_id))
                 else:
                     mm_inputs.append(req_state.mm_inputs[input_id])
                     req_input_ids.append((req_id, input_id))
@@ -894,6 +898,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Cache the encoder outputs.
         for (req_id, input_id), output in zip(req_input_ids, encoder_outputs):
+            if req_id not in self.encoder_cache:
+                self.encoder_cache[req_id] = {}
+            self.encoder_cache[req_id][input_id] = output
+
+        # HACK: Add an extra round to add the mm out token embeddings
+        # to the encoder cache.
+        grouped_mm_outputs_list = group_mm_inputs_by_modality(mm_outputs)
+        encoder_outputs_for_mm_outputs = []
+        for grouped_mm_outputs in grouped_mm_outputs_list:
+            batched_mm_outputs = MultiModalKwargs.batch(grouped_mm_outputs)
+            batched_mm_outputs = MultiModalKwargs.as_kwargs(batched_mm_outputs,
+                                                            device=self.device)
+
+            curr_group_outputs = self.model.get_multimodal_embeddings(
+                **batched_mm_outputs)
+
+            sanity_check_mm_encoder_outputs(
+                curr_group_outputs,
+                expected_num_items=len(grouped_mm_outputs),
+            )
+
+            for output in curr_group_outputs:
+                encoder_outputs_for_mm_outputs.append(output)
+
+        for (req_id, input_id), output in zip(req_input_ids_for_mm_outputs,
+                                              encoder_outputs_for_mm_outputs):
             if req_id not in self.encoder_cache:
                 self.encoder_cache[req_id] = {}
             self.encoder_cache[req_id][input_id] = output
