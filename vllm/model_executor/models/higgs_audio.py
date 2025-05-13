@@ -111,6 +111,73 @@ def _validate_and_reshape_mm_tensor(
             return torch.concat(mm_input)
 
 
+def _build_delay_pattern_mask(
+    input_ids: torch.LongTensor,
+    bos_token_id: int,
+    pad_token_id: int,
+):
+    """Implement the delay pattern proposed in "Simple and Controllable Music Generation", https://arxiv.org/pdf/2306.05284
+
+    In the delay pattern, each codebook is offset by the previous codebook by
+    one. We insert a special delay token at the start of the sequence if its delayed, and append pad token once the sequence finishes.
+
+    Take the example where there are 4 codebooks and audio sequence length=5. After shifting, the output should have length seq_len + num_codebooks - 1
+
+    - [ *,  *,  *,  *,  *,  P,  P,  P]
+    - [ B,  *,  *,  *,  *,  *,  P,  P]
+    - [ B,  B,  *,  *,  *,  *,  *,  P]
+    - [ B,  B,  B,  *,  *,  *,  *,  *]
+
+    where B indicates the delay token id, P is the special padding token id and `*` indicates that the original audio token.
+
+    Now let's consider the case where we have a sequence of audio tokens to condition on.
+    The audio tokens were originally in the following non-delayed form:
+
+    - [a, b]
+    - [c, d]
+    - [e, f]
+    - [g, h]
+
+    After conversion, we get the following delayed form:
+    - [a, b, -1, -1, -1]
+    - [B, c,  d, -1, -1]
+    - [B, B,  e,  f, -1]
+    - [B, B,  B,  g,  h]
+
+    Note that we have a special token `-1` that indicates it should be replaced by a new token we see in the generation phase.
+    In that case, we should override the `-1` tokens in auto-regressive generation.
+
+    Args:
+        input_ids (:obj:`torch.LongTensor`):
+            The input ids of the prompt. It will have shape (bsz, num_codebooks, seq_len).
+        bos_token_id (:obj:`int`):
+            The id of the special delay token
+        pad_token_id (:obj:`int`):
+            The id of the padding token. Should be the same as eos_token_id.
+
+    Returns:
+        input_ids (:obj:`torch.LongTensor`):
+            The transformed input ids with delay pattern applied. It will have shape (bsz, num_codebooks, seq_len + num_codebooks - 1).
+        input_ids_with_gen_mask (:obj:`torch.LongTensor`):
+            The transformed input ids with delay pattern applied. The -1 in the output indicates new tokens that should be generated.
+
+    """
+    bsz, num_codebooks, seq_len = input_ids.shape
+
+    new_seq_len = seq_len + num_codebooks - 1
+    input_ids_with_gen_mask = torch.ones((bsz, num_codebooks, new_seq_len),
+                                         dtype=torch.long,
+                                         device=input_ids.device)
+    bos_mask = torch.tril(input_ids_with_gen_mask, -1) > 0
+    eos_mask = torch.triu(input_ids_with_gen_mask, seq_len) > 0
+    input_ids_with_gen_mask[bos_mask] = bos_token_id
+    input_ids_with_gen_mask[(~bos_mask) & (~eos_mask)] = input_ids.reshape(-1)
+    input_ids = input_ids_with_gen_mask.clone()
+    input_ids[eos_mask] = pad_token_id
+    input_ids_with_gen_mask[eos_mask] = -1
+    return input_ids
+
+
 # Revised on top of transformers.models.qwen2_audio.modeling_qwen2_audio
 # with Qwen2AudioEncoder --> HiggsAudioEncoder
 # The code was originally borrowed from WhisperEncoder
@@ -453,6 +520,9 @@ def get_processor(
     HIGGS_AUDIO_TOKENIZER = os.getenv("HIGGS_AUDIO_TOKENIZER",
                                       "openai/whisper-large-v3-turbo")
 
+    audio_stream_bos_id = kwargs.pop("audio_stream_bos_id", None)
+    audio_stream_eos_id = kwargs.pop("audio_stream_eos_id", None)
+
     if HIGGS_AUDIO_TOKENIZER == "openai/whisper-large-v3-turbo":
         feature_extractor = AutoFeatureExtractor.from_pretrained(
             HIGGS_AUDIO_TOKENIZER,  # TODO: Write into config file
@@ -478,6 +548,8 @@ def get_processor(
     processor = HFHiggsAudioProcessor(
         feature_extractor=feature_extractor,
         tokenizer=tokenzier,
+        audio_stream_bos_id=audio_stream_bos_id,
+        audio_stream_eos_id=audio_stream_eos_id,
     )
     logger.info("Loaded HFHiggsAudioProcessor")
 
@@ -514,6 +586,9 @@ class HFHiggsAudioProcessor(ProcessorMixin):
         audio_token="<|AUDIO|>",
         audio_bos_token="<|audio_bos|>",
         audio_eos_token="<|audio_eos|>",
+        audio_stream_bos_id=None,
+        audio_stream_eos_id=None,
+        is_audio_out_model=False,
     ):
         if chat_template is None:
             chat_template = self.default_chat_template
@@ -524,6 +599,9 @@ class HFHiggsAudioProcessor(ProcessorMixin):
         self.audio_eos_token = (tokenizer.audio_eos_token if hasattr(
             tokenizer, "audio_eos_token") else audio_eos_token)
 
+        self.audio_stream_bos_id = audio_stream_bos_id
+        self.audio_stream_eos_id = audio_stream_eos_id
+        self.is_audio_out_model = is_audio_out_model
         # HACK: Workaround the class check in the base class
         if feature_extractor is not None:
             self.feature_extractor_class = feature_extractor.__class__.__name__
@@ -613,6 +691,31 @@ class HFHiggsAudioProcessor(ProcessorMixin):
                         a, self.feature_extractor.sampling_rate).unsqueeze(0)
                     for a in audio
                 ]
+
+                # -2 is the number of codebooks
+                num_codebook_dim = -2
+                use_delay_pattern = audio_ids[0].shape[num_codebook_dim] > 1
+                if use_delay_pattern:
+                    for i, audio_id in enumerate(audio_ids):
+                        audio_id = torch.cat([
+                            torch.full(
+                                (1, audio_id.shape[num_codebook_dim], 1),
+                                self.audio_stream_bos_id,
+                                dtype=torch.long,
+                                device=audio_id.device),
+                            audio_id,
+                            torch.full(
+                                (1, audio_id.shape[num_codebook_dim], 1),
+                                self.audio_stream_eos_id,
+                                dtype=torch.long,
+                                device=audio_id.device),
+                        ],
+                                             dim=-1)
+                        audio_ids[i] = \
+                            _build_delay_pattern_mask(audio_id,
+                                                      bos_token_id=self.audio_stream_bos_id,
+                                                      pad_token_id=self.audio_stream_eos_id)
+
                 audio_lengths = [a.shape[-1] for a in audio_ids]
                 audio_in_ids_length = torch.tensor(audio_lengths)
                 audio_in_ids = _validate_and_reshape_mm_tensor(audio_ids,
@@ -657,25 +760,6 @@ class HFHiggsAudioProcessor(ProcessorMixin):
                         num_audio_tokens = audio_lengths.pop(0)
 
                     expanded_audio_token = self.audio_token * num_audio_tokens
-
-                    audio_token_start_idx = sample.find(self.audio_token)
-                    audio_token_end_idx = (audio_token_start_idx +
-                                           len(self.audio_token))
-
-                    has_bos = (
-                        sample[audio_token_start_idx -
-                               len(self.audio_bos_token):audio_token_start_idx]
-                        == self.audio_bos_token)
-                    has_eos = (sample[audio_token_end_idx:audio_token_end_idx +
-                                      len(self.audio_eos_token)] ==
-                               self.audio_eos_token)
-
-                    # Check if this audio token is surrounded by bos/eos tokens
-                    if not has_bos and not has_eos:
-                        expanded_audio_token = (self.audio_bos_token +
-                                                expanded_audio_token +
-                                                self.audio_eos_token)
-
                     replace_str.append(expanded_audio_token)
                     sample = sample.replace(self.audio_token, "<placeholder>",
                                             1)
@@ -696,28 +780,37 @@ class HFHiggsAudioProcessor(ProcessorMixin):
     @property
     def default_chat_template(self):
         # fmt: off
+        if self.is_audio_out_model:
+            return (
+                "{% set loop_messages = messages %}"
+                "{% for message in loop_messages %}"
+                    "{% set content = '<|start_header_id|>' + message['role'] + "
+                    "'<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' %}"
+                    "{% if loop.index0 == 0 %}"
+                        "{% set content = bos_token + content %}"
+                    "{% endif %}"
+                    "{% if message['role'] == 'assistant' and '<|audio_bos|><|AUDIO|>' in message['content'] %}"
+                        "{% set content = content.replace('<|audio_bos|><|AUDIO|>', '<|audio_out_bos|><|AUDIO|>') %}"
+                    "{% endif %}"
+                    "{{ content }}"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}"
+                    "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|><|AUDIO_OUT|>' }}"
+                "{% endif %}"
+            )
+
         return (
             "{% set loop_messages = messages %}"
             "{% for message in loop_messages %}"
-                "<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n"
-                "{% if message['content'] is string %}"
-                    "{% set content = message['content'] | trim + '<|eot_id|>' %}"
-                "{% else %}"
-                    "{% for content in message['content'] %}"
-                        "{% if 'audio' in content or 'audio_url' in content %}"
-                            "{% set content = '<|audio_bos|><|AUDIO|><|audio_eos|>' %}"
-                        "{% elif 'text' in content %}"
-                            "{% set content = content['text'] %}"
-                        "{% endif %}"
-                    "{% endfor %}"
-                "{% endif %}"
+                "{% set content = '<|start_header_id|>' + message['role'] + "
+                "'<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' %}"
                 "{% if loop.index0 == 0 %}"
-                    "{% set content = bos_token + content %}"
-                "{% endif %}"
-                "{{ content }}<|eot_id|>"
+                "{% set content = bos_token + content %}"
+            "{% endif %}"
+            "{{ content }}"
             "{% endfor %}"
             "{% if add_generation_prompt %}"
-            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
+                "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
             "{% endif %}"
         )
         # fmt: on
@@ -738,7 +831,11 @@ class HiggsAudioProcessingInfo(BaseProcessingInfo):
         sampling_rate: Optional[int] = None,
         **kwargs: object,
     ) -> HFHiggsAudioProcessor:
-        return cached_get_processor(self.ctx.tokenizer)
+        hf_config = self.get_hf_config()
+        return cached_get_processor(
+            self.ctx.tokenizer,
+            audio_stream_bos_id=hf_config.audio_stream_bos_id,
+            audio_stream_eos_id=hf_config.audio_stream_eos_id)
 
     def get_feature_extractor(
         self,
@@ -759,9 +856,17 @@ class HiggsAudioProcessingInfo(BaseProcessingInfo):
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
         hf_config = self.get_hf_config()
-        max_source_position = \
-            hf_config.audio_encoder_config.max_source_positions
-        max_output_lengths = (max_source_position - 2) // 2 + 1
+        self.audio_tokenizer_type = os.getenv("HIGGS_AUDIO_TOKENIZER",
+                                              "openai/whisper-large-v3-turbo")
+        if self.audio_tokenizer_type == "openai/whisper-large-v3-turbo":
+            max_source_position = \
+                hf_config.audio_encoder_config.max_source_positions
+            max_output_lengths = (max_source_position - 2) // 2 + 1
+        else:
+            max_output_lengths = \
+                30 * self.get_feature_extractor().tps \
+                + self.get_feature_extractor().num_codebooks - 1 \
+                + 2 # bos and eos
         return {"audio": max_output_lengths}
 
 
@@ -786,7 +891,10 @@ class HiggsAudioMultiModalProcessor(
     ) -> BatchFeature:
         # Text-only input not supported in composite processor
         if not mm_data.get("audios", []):
-            prompt_ids = self.info.get_tokenizer().encode(prompt)
+            # Set add_special_tokens=False to avoid
+            # adding an extra begin of text token
+            prompt_ids = self.info.get_tokenizer().encode(
+                prompt, add_special_tokens=False)
             prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
             batch_data = BatchFeature(dict(input_ids=[prompt_ids]),
                                       tensor_type="pt")
@@ -830,14 +938,7 @@ class HiggsAudioMultiModalProcessor(
 
         # Use getattr with default to be compatible with transformers<4.48
         audio_token = getattr(processor, "audio_token", "<|AUDIO|>")
-        audio_bos_token = getattr(processor, "audio_bos_token",
-                                  "<|audio_bos|>")
-        audio_eos_token = getattr(processor, "audio_eos_token",
-                                  "<|audio_eos|>")
-
         audio_token_id = vocab[audio_token]
-        audio_bos_id = vocab[audio_bos_token]
-        audio_eos_id = vocab[audio_eos_token]
 
         audio_feature_attention_mask = out_mm_kwargs.get(
             "audio_feature_attention_mask")
@@ -865,7 +966,7 @@ class HiggsAudioMultiModalProcessor(
             audio_tokens = [audio_token_id] * num_features
 
             return PromptUpdateDetails(
-                full=[audio_bos_id] + audio_tokens + [audio_eos_id],
+                full=audio_tokens,
                 features=audio_tokens,
             )
 
@@ -901,13 +1002,6 @@ class HiggsAudioDummyInputsBuilder(
             self._get_dummy_audios(length=audio_len, num_audios=num_audios)
         }
 
-        # HACK: For Higgs audio generation, we need to insert the audio_out_ids
-        generate_audio_out_token = self.info.get_hf_config().skip_audio_tower
-        if generate_audio_out_token:
-            return ProcessorInputs(
-                prompt_text="<|AUDIO|>" * num_audios + "<|AUDIO_OUT|>",
-                mm_data=mm_data,
-            )
         return ProcessorInputs(
             prompt_text="<|AUDIO|>" * num_audios,
             mm_data=mm_data,

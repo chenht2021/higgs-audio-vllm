@@ -3,6 +3,7 @@
 import base64
 import os
 import re
+import textwrap
 from typing import Any
 
 import jiwer
@@ -32,6 +33,7 @@ TEXT_OUT_CHAT_TEMPLATE = (
     "{% endif %}")
 
 AUDIO_OUT_CHAT_TEMPLATE = (
+    # fmt: off
     "{% set loop_messages = messages %}"
     "{% for message in loop_messages %}"
     "{% set content = '<|start_header_id|>' + message['role'] + "
@@ -39,13 +41,56 @@ AUDIO_OUT_CHAT_TEMPLATE = (
     "{% if loop.index0 == 0 %}"
     "{% set content = bos_token + content %}"
     "{% endif %}"
+    "{% if message['role'] == 'assistant' and '<|audio_bos|><|AUDIO|>' in message['content'] %}"
+    "{% set content = content.replace('<|audio_bos|><|AUDIO|>', '<|audio_out_bos|><|AUDIO|>') %}"
+    "{% endif %}"
     "{{ content }}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
     "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|><|AUDIO_OUT|>' }}"
     "{% endif %}")
+# fmt: on
 
 TEST_MODEL_PATH = "/fsx/models/higgs_audio_test_models"
+
+
+def test_tts_chat_template():
+    from transformers import AutoTokenizer
+
+    chat_template = AUDIO_OUT_CHAT_TEMPLATE
+    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    conversation = [{
+        "role": "user",
+        "content": "Hello1"
+    }, {
+        "role": "assistant",
+        "content": "<|audio_bos|><|AUDIO|>"
+    }, {
+        "role": "user",
+        "content": "Hello2"
+    }]
+
+    result = tokenizer.apply_chat_template(
+        chat_template=chat_template,
+        conversation=conversation,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    ref = textwrap.dedent("""
+        <|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+        Hello1<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+        <|audio_out_bos|><|AUDIO|><|eot_id|><|start_header_id|>user<|end_header_id|>
+
+        Hello2<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+        <|audio_out_bos|><|AUDIO_OUT|>
+    """).lstrip('\n').rstrip('\n')
+    assert result == ref
 
 
 @pytest.fixture(scope="module")
@@ -144,6 +189,16 @@ def clean_punctuation(s):
     return re.sub(r'[^\w\s]', '', s)
 
 
+def clean_speaker_tag(s: str) -> str:
+    # Remove the speaker tag like [SPEAKER*] from the string
+    return re.sub(r"\[SPEAKER\d+\] ", "", s)
+
+
+def remove_newlines(s: str) -> str:
+    # Remove all newlines from the string
+    return s.replace("\n", " ")
+
+
 def test_audio_tts_zero_shot(speech_samples, asr_pipeline):
     batch_size = 20
     conversations = [
@@ -222,12 +277,120 @@ def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
         reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
         decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
         asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        # sf.write(f"audio_out_{i}.wav", decoded_audio, sr)
+        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
         reference += clean_punctuation(speech_samples[i]).lower()
         hypothesis += clean_punctuation(asr_text).lower()
 
     wer = jiwer.wer(reference, hypothesis)
     print(f"WER: {wer}")
+    assert wer < 0.05
+
+
+@pytest.fixture(scope="module")
+def dialogue_sample_1():
+    audio_woman_path = "en_woman_1.wav"
+    audio_woman_base64 = encode_base64_content_from_file(audio_woman_path)
+    audio_man_path = "en_man_1.wav"
+    audio_man_base64 = encode_base64_content_from_file(audio_man_path)
+    dialogue_sample = [{
+        "role":
+        "user",
+        "content": [
+            "[SPEAKER0] The device would work during the day as well, if you took steps to either block direct sunlightor point it away from the sun."
+        ]
+    }, {
+        "role":
+        "assistant",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": audio_woman_base64,
+            }
+        }]
+    }, {
+        "role":
+        "user",
+        "content": [
+            "[SPEAKER1] Maintaining your ability to learn translates into increased marketability, improved career optionsand higher salaries."
+        ]
+    }, {
+        "role":
+        "assistant",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": audio_man_base64,
+            }
+        }]
+    }, {
+        "role":
+        "user",
+        "content": [
+            "[SPEAKER0] Hello, how are you doing today?\n[SPEAKER1] I'm doing great, thank you!"
+        ]
+    }]
+    return dialogue_sample
+
+
+def test_audio_tts_dialogue(speech_samples, dialogue_sample_1, asr_pipeline):
+    audio_tokenizer_type = "xcodec_tps25_0215"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+    llm = LLM(model=model_path,
+              max_model_len=1024,
+              limit_mm_per_prompt={"audio": 50},
+              enforce_eager=True)
+    sampling_params = SamplingParams(temperature=0.7,
+                                     stop=["<|eot_id|>", "<|end_of_text|>"],
+                                     max_tokens=512)
+
+    batch_size = 20
+    conversations = []
+    # Mix the dialogue sample with the voice clone sample
+    for i in range(batch_size):
+        if i % 2 == 0:
+            conversations.append(dialogue_sample_1)
+        else:
+            conversations.append(
+                prepare_tts_voice_clone_sample(speech_samples[i % 20],
+                                               "en_woman_1.wav"))
+
+    outputs = llm.chat(
+        conversations,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+        chat_template=AUDIO_OUT_CHAT_TEMPLATE,
+    )
+
+    audio_tokenizer = AudioTokenizer(
+        "xcodec_tps25_0215",
+        downloaded_model_path=
+        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+
+    reference = ""
+    hypothesis = ""
+    for i in range(len(outputs)):
+        audio_out_ids = \
+            np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
+        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
+        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
+        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
+        #sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
+        if i % 2 == 0:
+            reference += clean_punctuation(
+                remove_newlines(
+                    clean_speaker_tag(
+                        dialogue_sample_1[-1]["content"][0]))).lower()
+        else:
+            reference += clean_punctuation(speech_samples[i % 20]).lower()
+        hypothesis += clean_punctuation(asr_text).lower()
+
+    wer = jiwer.wer(reference, hypothesis)
+    print(f"WER: {wer}")
+    print(f"Reference: {reference}")
+    print(f"Hypothesis: {hypothesis}")
     assert wer < 0.05
 
 
