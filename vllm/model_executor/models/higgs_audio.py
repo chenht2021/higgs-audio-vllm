@@ -41,7 +41,6 @@ from vllm.model_executor.models.utils import (extract_layer_index,
                                               is_pp_missing_parameter,
                                               make_layers,
                                               merge_multimodal_embeddings)
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalFieldConfig, MultiModalKwargs,
                                     NestedTensors)
@@ -52,6 +51,7 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         PromptUpdate, PromptUpdateDetails)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.sequence import IntermediateTensors
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from .higgs_audio_config import HiggsAudioConfig, HiggsAudioEncoderConfig
 from .higgs_audio_tokenizer import AudioTokenizer
@@ -66,7 +66,7 @@ _KEYS_TO_MODIFY_MAPPING = {
 AutoConfig.register("higgs_audio_encoder", HiggsAudioEncoderConfig)
 AutoConfig.register("higgs_audio", HiggsAudioConfig)
 AutoFeatureExtractor.register(HiggsAudioConfig, AudioTokenizer)
-if transformers.__version__ == "4.46.0":
+if transformers.__version__.startswith("4.46"):
     transformers._modules.add("AudioTokenizer")
     transformers.AudioTokenizer = AudioTokenizer
 
