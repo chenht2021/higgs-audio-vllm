@@ -12,6 +12,7 @@ from typing import Any, List, Optional, Set, Tuple, TypedDict, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import transformers
 from transformers import (AutoConfig, AutoFeatureExtractor, BatchFeature,
                           ProcessorMixin)
 from transformers.modeling_outputs import BaseModelOutput
@@ -65,6 +66,9 @@ _KEYS_TO_MODIFY_MAPPING = {
 AutoConfig.register("higgs_audio_encoder", HiggsAudioEncoderConfig)
 AutoConfig.register("higgs_audio", HiggsAudioConfig)
 AutoFeatureExtractor.register(HiggsAudioConfig, AudioTokenizer)
+if transformers.__version__ == "4.46.0":
+    transformers._modules.add("AudioTokenizer")
+    transformers.AudioTokenizer = AudioTokenizer
 
 
 # # === Audio Inputs === #
