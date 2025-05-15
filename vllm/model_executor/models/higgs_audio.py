@@ -590,6 +590,7 @@ class HFHiggsAudioProcessor(ProcessorMixin):
         audio_stream_eos_id=None,
         is_audio_out_model=False,
     ):
+        self.is_audio_out_model = is_audio_out_model
         if chat_template is None:
             chat_template = self.default_chat_template
         self.audio_token = (tokenizer.audio_token if hasattr(
@@ -601,7 +602,6 @@ class HFHiggsAudioProcessor(ProcessorMixin):
 
         self.audio_stream_bos_id = audio_stream_bos_id
         self.audio_stream_eos_id = audio_stream_eos_id
-        self.is_audio_out_model = is_audio_out_model
         # HACK: Workaround the class check in the base class
         if feature_extractor is not None:
             self.feature_extractor_class = feature_extractor.__class__.__name__
