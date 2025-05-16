@@ -954,6 +954,8 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning_content = None
                 content = output.text
 
+            mm_token_ids = output.mm_token_ids
+
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
             if (not self.enable_auto_tools or not self.tool_parser) and \
@@ -962,7 +964,8 @@ class OpenAIServingChat(OpenAIServing):
                                 ) and request.tool_choice != "required"):
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_content,
-                                      content=content)
+                                      content=content,
+                                      mm_token_ids=mm_token_ids)
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(
@@ -1004,7 +1007,8 @@ class OpenAIServingChat(OpenAIServing):
 
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_content,
-                                      content=content)
+                                      content=content,
+                                      mm_token_ids=mm_token_ids)
 
             # handle when there are tools and tool choice is auto
             elif request.tools and (
@@ -1045,7 +1049,8 @@ class OpenAIServingChat(OpenAIServing):
                     "completion.")
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_content,
-                                      content=content)
+                                      content=content,
+                                      mm_token_ids=mm_token_ids)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,

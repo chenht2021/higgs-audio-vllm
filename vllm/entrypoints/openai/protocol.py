@@ -1293,6 +1293,7 @@ class ChatMessage(OpenAIBaseModel):
     reasoning_content: Optional[str] = None
     content: Optional[str] = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    mm_token_ids: Optional[list[list[int]]] = None
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
