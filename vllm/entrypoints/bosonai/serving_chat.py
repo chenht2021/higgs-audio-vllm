@@ -1,4 +1,3 @@
-# ruff: noqa
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import base64
@@ -138,9 +137,9 @@ class HiggsAudioServeEngine(OpenAIServing):
         self.hamming_window_len = \
             2 * self.audio_num_codebooks * self.samples_per_token
 
+    # ruff: noqa: E501  # Disable specific lint rules
     def get_chat_template(
             self, modalities: Optional[list[ChatCompletionModality]]) -> str:
-        # noqa: E501  # Disable specific lint rules
         if modalities is not None and "audio" in modalities:
             # fmt: off
             return (
