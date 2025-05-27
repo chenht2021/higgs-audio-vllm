@@ -176,6 +176,16 @@ class LogitsProcessorConstructor(BaseModel):
     kwargs: Optional[dict[str, Any]] = None
 
 
+class ChatCompletionAudioParam(BaseModel):
+    format: Literal["wav", "mp3", "flac", "opus", "pcm16"] = "wav"
+    voice: Literal["alloy", "ash", "ballad", "coral", "echo", "sage",
+                   "shimmer", "verse"] = "alloy"
+    chunk_size: Optional[int] = None
+    chunk_overlap_size: Optional[int] = None
+
+
+ChatCompletionModality = Literal["text", "audio"]
+
 LogitsProcessors = list[Union[str, LogitsProcessorConstructor]]
 
 
@@ -261,6 +271,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     prompt_logprobs: Optional[int] = None
+    modalities: Optional[list[ChatCompletionModality]] = None
+    audio: Optional[ChatCompletionAudioParam] = None
+
     # doc: end-chat-completion-sampling-params
 
     # doc: begin-chat-completion-extra-params
@@ -1288,12 +1301,19 @@ class ExtractedToolCallInformation(BaseModel):
     content: Optional[str] = None
 
 
+class ChatCompletionAudio(BaseModel):
+    id: str
+    data: str
+    expires_at: int
+    transcript: str
+
+
 class ChatMessage(OpenAIBaseModel):
     role: str
     reasoning_content: Optional[str] = None
     content: Optional[str] = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
-    mm_token_ids: Optional[list[list[int]]] = None
+    audio: Optional[ChatCompletionAudio] = None
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):

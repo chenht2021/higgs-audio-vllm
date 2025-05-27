@@ -2,6 +2,7 @@
 # ruff: noqa
 import asyncio
 import base64
+import io
 import os
 import re
 import textwrap
@@ -16,8 +17,8 @@ import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 from vllm import LLM, SamplingParams
+from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServeEngine
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_models import (BaseModelPath,
                                                     OpenAIServingModels)
 from vllm.model_executor.models.higgs_audio_tokenizer import (
@@ -483,14 +484,14 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
         model_config=model_config,
         base_model_paths=base_model_paths,
     )
-    openai_serving_chat = OpenAIServingChat(
+    serving_chat = HiggsAudioServeEngine(
         engine,
         model_config,
         openai_serving_models,
         response_role="assistant",
         request_logger=None,
-        chat_template=AUDIO_OUT_CHAT_TEMPLATE,
         chat_template_content_format="auto",
+        audio_tokenizer=audio_tokenizer,
     )
 
     async def process_request(conversation):
@@ -501,8 +502,7 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
             temperature=0.7,
             stop=["<|eot_id|>", "<|end_of_text|>"],
         )
-        output = await openai_serving_chat.create_chat_completion(request_json)
-        print(output)
+        output = await serving_chat.create_chat_completion(request_json)
         return output
 
     # Create tasks for each conversation
@@ -519,12 +519,12 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
     reference = ""
     hypothesis = ""
     for i, output in enumerate(outputs):
-        audio_out_ids = \
-            np.array(output.choices[0].message.mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
-        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
-        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
-        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
+        audio_data = base64.b64decode(output.choices[0].message.audio.data)
+        with open(f"audio_dumps/audio_out_{i}.wav", "wb") as f:
+            f.write(audio_data)
+        audio_stream = io.BytesIO(audio_data)
+        decoded_audio, sr = sf.read(audio_stream, dtype='int16')
+        asr_text = _get_asr(decoded_audio.astype(np.float32), sr, asr_pipeline)
         reference += clean_punctuation(speech_samples[i % 20]).lower()
         hypothesis += clean_punctuation(asr_text).lower()
 
