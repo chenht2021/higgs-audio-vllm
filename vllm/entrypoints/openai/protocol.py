@@ -1358,6 +1358,7 @@ class DeltaMessage(OpenAIBaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+    audio: Optional[ChatCompletionAudio] = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):

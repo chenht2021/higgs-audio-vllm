@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import io
+import json
 import os
 import re
 import textwrap
@@ -196,7 +197,7 @@ def encode_base64_content_from_file(file_path: str) -> str:
 
 
 def clean_punctuation(s):
-    return re.sub(r'[^\w\s]', '', s)
+    return re.sub(r'[^\w\s]', ' ', s)
 
 
 def clean_speaker_tag(s: str) -> str:
@@ -448,6 +449,9 @@ def test_audio_in_text_out():
 
 @pytest.mark.asyncio
 async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
     audio_tokenizer_type = "xcodec_tps25_0215"
     audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
     os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
@@ -525,6 +529,120 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
         audio_stream = io.BytesIO(audio_data)
         decoded_audio, sr = sf.read(audio_stream, dtype='int16')
         asr_text = _get_asr(decoded_audio.astype(np.float32), sr, asr_pipeline)
+        reference += clean_punctuation(speech_samples[i % 20]).lower()
+        hypothesis += clean_punctuation(asr_text).lower()
+
+    wer = jiwer.wer(reference, hypothesis)
+    print(f"WER: {wer}")
+    assert wer < 0.05
+
+
+@pytest.mark.asyncio
+async def test_audio_tts_voice_clone_async_streaming(speech_samples,
+                                                     asr_pipeline):
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
+    audio_tokenizer_type = "xcodec_tps25_0215"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+
+    audio_tokenizer = AudioTokenizer(
+        "xcodec_tps25_0215",
+        downloaded_model_path=
+        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+
+    batch_size = 20
+    ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
+    conversations = [
+        prepare_tts_voice_clone_sample(
+            speech_samples[i], ref_audio_paths[i % len(ref_audio_paths)])
+        for i in range(batch_size)
+    ]
+
+    vllm_config = AsyncEngineArgs(model=model_path,
+                                  max_model_len=1024,
+                                  limit_mm_per_prompt={
+                                      "audio": 50
+                                  },
+                                  enforce_eager=True).create_engine_config(
+                                      UsageContext.ENGINE_CONTEXT)
+    engine = AsyncLLM.from_vllm_config(vllm_config)
+    model_config = await engine.get_model_config()
+    base_model_paths = [
+        BaseModelPath(name="higgs_audio", model_path=model_path)
+    ]
+    openai_serving_models = OpenAIServingModels(
+        engine_client=engine,
+        model_config=model_config,
+        base_model_paths=base_model_paths,
+    )
+    serving_chat = HiggsAudioServeEngine(
+        engine,
+        model_config,
+        openai_serving_models,
+        response_role="assistant",
+        request_logger=None,
+        chat_template_content_format="auto",
+        audio_tokenizer=audio_tokenizer,
+    )
+
+    async def process_request(conversation):
+        request_json = ChatCompletionRequest(
+            messages=conversation,
+            model="higgs_audio",
+            max_completion_tokens=500,
+            temperature=0.7,
+            stop=["<|eot_id|>", "<|end_of_text|>"],
+            stream=True)
+        audio_bytes_io = io.BytesIO()
+        i = 0
+        output = await serving_chat.create_chat_completion(request_json)
+        async for chunk_str in output:
+            # Parse the SSE format: "data: {json}\n\n"
+            if chunk_str.startswith("data: "):
+                json_str = chunk_str[6:]  # Remove "data: " prefix
+                if json_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(json_str)
+                    # print(f"Chunk {i}: {chunk}")
+                    if (chunk.get("choices")
+                            and chunk["choices"][0].get("delta")
+                            and chunk["choices"][0]["delta"].get("audio")):
+                        audio_bytes = base64.b64decode(
+                            chunk["choices"][0]["delta"]["audio"]["data"])
+                        audio_bytes_io.write(audio_bytes)
+                        i += 1
+                except json.JSONDecodeError:
+                    # Skip malformed JSON
+                    continue
+            else:
+                print(chunk_str)
+        audio_bytes_io.seek(0)
+        audio_data = np.frombuffer(audio_bytes_io.getvalue(), dtype=np.int16)
+        return audio_data
+
+    # Create tasks for each conversation
+    tasks = []
+    for i in range(batch_size):
+        task = asyncio.create_task(process_request(conversations[i]))
+        tasks.append(task)
+
+        # Add a 10ms delay between requests
+        await asyncio.sleep(0.01)
+
+    outputs = await asyncio.gather(*tasks)
+    assert len(outputs) == batch_size
+    reference = ""
+    hypothesis = ""
+    for i, output in enumerate(outputs):
+        sf.write(f"audio_dumps/audio_out_{i}.wav", output,
+                 audio_tokenizer.sampling_rate)
+        asr_text = _get_asr(output.astype(np.float32),
+                            audio_tokenizer.sampling_rate, asr_pipeline)
         reference += clean_punctuation(speech_samples[i % 20]).lower()
         hypothesis += clean_punctuation(asr_text).lower()
 

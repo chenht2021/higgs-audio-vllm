@@ -92,11 +92,11 @@ def revert_delay_pattern(data):
     """Convert samples encoded with delay pattern back to the original form.
 
     Args:
-        data (:obj:`torch.Tensor`):
+        data (:obj:`np.ndarray`):
             The data with delay pattern applied. It will have shape (num_codebooks, seq_len + num_codebooks - 1).
 
     Returns:
-        ret (:obj:`torch.Tensor`):
+        ret (:obj:`np.ndarray`):
             Recovered data with delay pattern removed. It will have shape (num_codebooks, seq_len).
     """
     assert len(data.shape) == 2

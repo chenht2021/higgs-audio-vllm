@@ -157,6 +157,11 @@ class RequestOutput:
                         next_completion.cumulative_logprob)
                     completion.finish_reason = next_completion.finish_reason
                     completion.stop_reason = next_completion.stop_reason
+                    if next_completion.mm_token_ids is not None:
+                        if completion.mm_token_ids is None:
+                            completion.mm_token_ids = []
+                        completion.mm_token_ids.extend(
+                            next_completion.mm_token_ids)
                     break
             else:
                 self.outputs.append(next_completion)
