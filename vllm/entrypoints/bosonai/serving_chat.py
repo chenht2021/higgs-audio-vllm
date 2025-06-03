@@ -66,7 +66,7 @@ class HiggsAudioServeEngine(OpenAIServing):
         response_role: str,
         *,
         request_logger: Optional[RequestLogger],
-        # chat_template: Optional[str],
+        chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
         return_tokens_as_token_ids: bool = False,
         enable_reasoning: bool = False,
@@ -85,7 +85,7 @@ class HiggsAudioServeEngine(OpenAIServing):
         # Add a lock for generation
         self.request_logger = request_logger
         self.response_role = response_role
-        # self.chat_template = chat_template
+        self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
         self.enable_reasoning = enable_reasoning
         self.reasoning_parser = reasoning_parser
@@ -148,6 +148,9 @@ class HiggsAudioServeEngine(OpenAIServing):
     # ruff: noqa: E501  # Disable specific lint rules
     def get_chat_template(
             self, modalities: Optional[list[ChatCompletionModality]]) -> str:
+        if self.chat_template is not None:
+            return self.chat_template
+
         if modalities is not None and "audio" in modalities:
             # fmt: off
             return (
