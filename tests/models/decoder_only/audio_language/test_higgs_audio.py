@@ -18,8 +18,11 @@ import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 from vllm import LLM, SamplingParams
-from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServeEngine
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest
+from vllm.entrypoints.bosonai.serving_audio import HiggsAudioServingAudio
+from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServingChat
+from vllm.entrypoints.logger import RequestLogger
+from vllm.entrypoints.openai.protocol import (AudioSpeechRequest,
+                                              ChatCompletionRequest)
 from vllm.entrypoints.openai.serving_models import (BaseModelPath,
                                                     OpenAIServingModels)
 from vllm.model_executor.models.higgs_audio_tokenizer import (
@@ -61,6 +64,8 @@ AUDIO_OUT_CHAT_TEMPLATE = (
 # fmt: on
 
 TEST_MODEL_PATH = "/fsx/models/higgs_audio_test_models"
+
+OPENAI_TTS_SAMPLE_RATE = 24000
 
 
 def test_tts_chat_template():
@@ -143,6 +148,19 @@ def prepare_tts_voice_clone_sample(text: str, ref_audio_path: str):
                 "format": "wav",
             }
         }]
+    }, {
+        "role": "user",
+        "content": text
+    }]
+    return tts_sample
+
+
+def prepare_emergent_tts_sample(text: str):
+    tts_sample = [{
+        "role":
+        "system",
+        "content":
+        "You are an AI assistant designed to convert text into speech for podcast.\nIf the user's message includes a [SPEAKER*] tag, do not read out the tag and generate speech for the following text, using the specified voice. If no speaker tag is present, select a suitable voice for the audiobook's tone and style.\nThe audio may contain artifacts."
     }, {
         "role": "user",
         "content": text
@@ -252,6 +270,9 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline):
 
 
 def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
     audio_tokenizer_type = "xcodec_tps25_0215"
     audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
     os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
@@ -488,7 +509,7 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
         model_config=model_config,
         base_model_paths=base_model_paths,
     )
-    serving_chat = HiggsAudioServeEngine(
+    serving_chat = HiggsAudioServingChat(
         engine,
         model_config,
         openai_serving_models,
@@ -505,7 +526,7 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
             max_completion_tokens=500,
             temperature=0.7,
             stop=["<|eot_id|>", "<|end_of_text|>"],
-        )
+            modalities=["audio", "text"])
         output = await serving_chat.create_chat_completion(request_json)
         return output
 
@@ -547,18 +568,16 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
     audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
     os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
     os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+    model_path = "/fsx/models/releases/higgs-audio-generation-3b-v1.0-sft-20250331/"
 
     audio_tokenizer = AudioTokenizer(
         "xcodec_tps25_0215",
         downloaded_model_path=
         "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
 
-    batch_size = 20
-    ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
+    batch_size = 1
     conversations = [
-        prepare_tts_voice_clone_sample(
-            speech_samples[i], ref_audio_paths[i % len(ref_audio_paths)])
+        prepare_emergent_tts_sample(speech_samples[i])
         for i in range(batch_size)
     ]
 
@@ -579,7 +598,7 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
         model_config=model_config,
         base_model_paths=base_model_paths,
     )
-    serving_chat = HiggsAudioServeEngine(
+    serving_chat = HiggsAudioServingChat(
         engine,
         model_config,
         openai_serving_models,
@@ -594,9 +613,11 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
             messages=conversation,
             model="higgs_audio",
             max_completion_tokens=500,
-            temperature=0.7,
+            top_p=0.95,
+            temperature=1,
             stop=["<|eot_id|>", "<|end_of_text|>"],
-            stream=True)
+            stream=True,
+            modalities=["audio", "text"])
         audio_bytes_io = io.BytesIO()
         i = 0
         output = await serving_chat.create_chat_completion(request_json)
@@ -643,6 +664,104 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
                  audio_tokenizer.sampling_rate)
         asr_text = _get_asr(output.astype(np.float32),
                             audio_tokenizer.sampling_rate, asr_pipeline)
+        reference += clean_punctuation(speech_samples[i % 20]).lower()
+        hypothesis += clean_punctuation(asr_text).lower()
+
+    wer = jiwer.wer(reference, hypothesis)
+    print(f"WER: {wer}")
+    assert wer < 0.05
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_api(speech_samples, asr_pipeline):
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
+    audio_tokenizer_type = "xcodec_tps25_0215"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+    # model_path = "/fsx/models/releases/higgs-audio-generation-3b-v1.0-sft-20250331/"
+    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
+
+    audio_tokenizer = AudioTokenizer(
+        "xcodec_tps25_0215",
+        downloaded_model_path=
+        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+
+    batch_size = 1
+    vllm_config = AsyncEngineArgs(model=model_path,
+                                  max_model_len=1024,
+                                  limit_mm_per_prompt={
+                                      "audio": 50
+                                  },
+                                  enforce_eager=True).create_engine_config(
+                                      UsageContext.ENGINE_CONTEXT)
+    engine = AsyncLLM.from_vllm_config(vllm_config)
+    model_config = await engine.get_model_config()
+    base_model_paths = [
+        BaseModelPath(name="higgs_audio", model_path=model_path)
+    ]
+    openai_serving_models = OpenAIServingModels(
+        engine_client=engine,
+        model_config=model_config,
+        base_model_paths=base_model_paths,
+    )
+    voice_presets_dir = os.path.join(os.path.dirname(__file__), "..", "..",
+                                     "..", "..",
+                                     "vllm/entrypoints/bosonai/voice_presets")
+    voice_presets = json.load(
+        open(os.path.join(voice_presets_dir, "config.json")))
+
+    request_logger = RequestLogger(max_log_len=None)
+    serving_audio = HiggsAudioServingAudio(
+        engine,
+        model_config,
+        openai_serving_models,
+        request_logger=request_logger,
+        chat_template_content_format="auto",
+        audio_tokenizer=audio_tokenizer,
+        voice_presets_dir=voice_presets_dir,
+    )
+
+    async def process_request(text: str):
+        request_json = AudioSpeechRequest(
+            voice="en_woman_1",
+            input=text,
+            model="higgs_audio",
+            response_format="pcm",
+            temperature=0.7,
+            top_p=0.95,
+        )
+        output = await serving_audio.create_audio_speech_stream(
+            request=request_json,
+            voice_presets=voice_presets,
+        )
+        audio_bytes = b''
+        async for chunk in output:
+            audio_bytes += chunk
+
+        audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+        return audio_data
+
+    # Create tasks for each conversation
+    tasks = []
+    for i in range(batch_size):
+        task = asyncio.create_task(process_request(speech_samples[i % 20]))
+        tasks.append(task)
+
+        # Add a 10ms delay between requests
+        await asyncio.sleep(0.01)
+
+    outputs = await asyncio.gather(*tasks)
+    assert len(outputs) == batch_size
+    reference = ""
+    hypothesis = ""
+    for i, output in enumerate(outputs):
+        sf.write(f"audio_dumps/audio_out_{i}.wav", output,
+                 OPENAI_TTS_SAMPLE_RATE)
+        asr_text = _get_asr(output.astype(np.float32), OPENAI_TTS_SAMPLE_RATE,
+                            asr_pipeline)
         reference += clean_punctuation(speech_samples[i % 20]).lower()
         hypothesis += clean_punctuation(asr_text).lower()
 

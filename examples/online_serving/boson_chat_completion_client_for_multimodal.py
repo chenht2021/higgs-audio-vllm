@@ -5,6 +5,7 @@ and run online inference with OpenAI client.
 import argparse
 import base64
 import os
+import time
 from io import BytesIO
 
 import numpy as np
@@ -126,6 +127,7 @@ def run_tts(stream: bool = False) -> None:
          "trembled with age, and his violin sat untouched in its case for "
          "many years.")
     }]
+    start_time = time.time()
     chat_completion = client.chat.completions.create(
         messages=messages,
         model=model,
@@ -137,19 +139,24 @@ def run_tts(stream: bool = False) -> None:
     if stream:
         audio_bytes_io = BytesIO()
         i = 0
+        first_audio_latency = None
         for chunk in chat_completion:
             if chunk.choices and hasattr(
                     chunk.choices[0].delta,
                     'audio') and chunk.choices[0].delta.audio:
+                if first_audio_latency is None:
+                    first_audio_latency = time.time() - start_time
                 audio_bytes = base64.b64decode(
                     chunk.choices[0].delta.audio["data"])
                 audio_bytes_io.write(audio_bytes)
                 audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                sf.write(f"output_tts_{i}.wav", audio_data, target_rate)
+                # sf.write(f"output_tts_{i}.wav", audio_data, target_rate)
                 i += 1
         audio_bytes_io.seek(0)
         audio_data = np.frombuffer(audio_bytes_io.getvalue(), dtype=np.int16)
         print("Saving the audio to file")
+        print(f"First audio latency: {first_audio_latency * 1000} ms")
+        print(f"Total audio latency: {(time.time() - start_time) * 1000} ms")
         sf.write("output_tts.wav", audio_data, target_rate)
     else:
         text = chat_completion.choices[0].message.content

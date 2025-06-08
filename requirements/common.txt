@@ -48,3 +48,4 @@ s3fs
 omegaconf
 descript-audiotools>=0.7.2
 descript-audio-codec
+pydub

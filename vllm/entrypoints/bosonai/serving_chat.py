@@ -5,7 +5,6 @@ import io
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
-from functools import lru_cache
 from typing import Callable, Final, Optional, Union
 
 import jinja2
@@ -40,6 +39,8 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import random_uuid
 
+from .utils import create_audio_chunk
+
 logger = init_logger(__name__)
 
 
@@ -51,12 +52,7 @@ def convert_audio_to_base64(audio: np.ndarray,
     return base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
 
 
-@lru_cache
-def _get_hamming_window(len):
-    return np.hamming(len)
-
-
-class HiggsAudioServeEngine(OpenAIServing):
+class HiggsAudioServingChat(OpenAIServing):
 
     def __init__(
         self,
@@ -66,8 +62,8 @@ class HiggsAudioServeEngine(OpenAIServing):
         response_role: str,
         *,
         request_logger: Optional[RequestLogger],
-        chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
+        chat_template: Optional[str] = None,
         return_tokens_as_token_ids: bool = False,
         enable_reasoning: bool = False,
         reasoning_parser: Optional[str] = None,
@@ -82,7 +78,6 @@ class HiggsAudioServeEngine(OpenAIServing):
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)
 
-        # Add a lock for generation
         self.request_logger = request_logger
         self.response_role = response_role
         self.chat_template = chat_template
@@ -397,14 +392,17 @@ class HiggsAudioServeEngine(OpenAIServing):
                     audio_chunk = None
                     if output.mm_token_ids is None:
                         if audio_tokens_cache[i].shape[0] > 0:
-                            audio_chunk, fade_out_audio[
-                                i] = self._create_audio_chunk(
-                                    audio_tokens_cache[i],
-                                    audio_chunk_size,
-                                    fade_out_audio[i],
-                                    finalize=True,
-                                    is_first_chunk=is_first_audio_chunk[i],
-                                )
+                            audio_chunk, fade_out_audio[i] = create_audio_chunk(
+                                audio_tokens_cache[i],
+                                audio_chunk_size,
+                                fade_out_audio[i],
+                                finalize=True,
+                                is_first_chunk=is_first_audio_chunk[i],
+                                audio_tokenizer=self.audio_tokenizer,
+                                audio_codebook_size=self.audio_codebook_size,
+                                samples_per_token=self.samples_per_token,
+                                audio_num_codebooks=self.audio_num_codebooks,
+                            )
                             audio_tokens_cache[i] = np.ndarray(
                                 (0, self.audio_num_codebooks), dtype=np.int64)
                             fade_out_audio[i] = None
@@ -424,27 +422,33 @@ class HiggsAudioServeEngine(OpenAIServing):
                             curr_audio_chunk_size >= (audio_chunk_size + self.audio_num_codebooks - 1):
                             first_audio_chunk_size = \
                                 int(audio_chunk_size - self.audio_num_codebooks + 1)
-                            audio_chunk, fade_out_audio[
-                                i] = self._create_audio_chunk(
-                                    audio_tokens_cache[i],
-                                    first_audio_chunk_size,
-                                    fade_out_audio[i],
-                                    finalize=False,
-                                    is_first_chunk=True,
-                                )
+                            audio_chunk, fade_out_audio[i] = create_audio_chunk(
+                                audio_tokens_cache[i],
+                                first_audio_chunk_size,
+                                fade_out_audio[i],
+                                finalize=False,
+                                is_first_chunk=True,
+                                audio_tokenizer=self.audio_tokenizer,
+                                audio_codebook_size=self.audio_codebook_size,
+                                samples_per_token=self.samples_per_token,
+                                audio_num_codebooks=self.audio_num_codebooks,
+                            )
                             audio_tokens_cache[i] = audio_tokens_cache[i][
                                 first_audio_chunk_size:]
                             is_first_audio_chunk[i] = False
                         elif not is_first_audio_chunk[i] and \
                             curr_audio_chunk_size >= (audio_chunk_size + audio_chunk_overlap_size):
-                            audio_chunk, fade_out_audio[
-                                i] = self._create_audio_chunk(
-                                    audio_tokens_cache[i],
-                                    audio_chunk_size,
-                                    fade_out_audio[i],
-                                    finalize=False,
-                                    is_first_chunk=False,
-                                )
+                            audio_chunk, fade_out_audio[i] = create_audio_chunk(
+                                audio_tokens_cache[i],
+                                audio_chunk_size,
+                                fade_out_audio[i],
+                                finalize=False,
+                                is_first_chunk=False,
+                                audio_tokenizer=self.audio_tokenizer,
+                                audio_codebook_size=self.audio_codebook_size,
+                                samples_per_token=self.samples_per_token,
+                                audio_num_codebooks=self.audio_num_codebooks,
+                            )
                             audio_tokens_cache[i] = audio_tokens_cache[i][
                                 audio_chunk_size:]
 
@@ -721,11 +725,15 @@ class HiggsAudioServeEngine(OpenAIServing):
             # Process any remaining audio tokens if any
             for i in range(num_choices):
                 if audio_tokens_cache[i].shape[0] > 0:
-                    audio_chunk, fade_out_audio[i] = self._create_audio_chunk(
+                    audio_chunk, fade_out_audio[i] = create_audio_chunk(
                         audio_tokens_cache[i],
                         audio_chunk_size,
                         fade_out_audio[i],
                         is_first_chunk=is_first_audio_chunk[i],
+                        audio_tokenizer=self.audio_tokenizer,
+                        audio_codebook_size=self.audio_codebook_size,
+                        samples_per_token=self.samples_per_token,
+                        audio_num_codebooks=self.audio_num_codebooks,
                         finalize=True)
                     if audio_chunk is not None:
                         delta_message = DeltaMessage(audio=audio_chunk)
@@ -1160,70 +1168,6 @@ class HiggsAudioServeEngine(OpenAIServing):
         )
 
         return response
-
-    def _create_audio_chunk(
-        self,
-        audio_tokens_cache: np.ndarray,
-        audio_chunk_size: int,
-        fade_out_audio: Optional[np.ndarray],
-        is_first_chunk: bool,
-        finalize: bool = False,
-    ) -> tuple[Optional[ChatCompletionAudio], np.ndarray]:
-        new_audio, new_fade_out_audio = self._token2wav(
-            audio_tokens_cache,
-            audio_chunk_size,
-            is_first_chunk=is_first_chunk,
-            fade_out_audio=fade_out_audio,
-            finalize=finalize)
-
-        audio_pcm16 = (new_audio * np.iinfo(np.int16).max).astype(np.int16)
-        return ChatCompletionAudio(
-            id=f"audio-{random_uuid()}",
-            data=base64.b64encode(audio_pcm16).decode("utf-8"),
-            expires_at=0,
-            transcript="",
-        ), new_fade_out_audio
-
-    def _token2wav(
-        self,
-        token: np.ndarray,
-        audio_chunk_size: int,
-        is_first_chunk: bool,
-        fade_out_audio: Optional[np.ndarray] = None,
-        finalize: bool = False,
-    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
-        # The input token is (# of tokens, # of codebooks)
-        # Transpose to (# of codebooks, # of tokens)
-        token = token.transpose(1, 0)
-
-        if token.shape[1] <= self.audio_num_codebooks + 2:
-            logger.warning(
-                "The audio token length %s is too short. Skipping this chunk.",
-                token.shape[1])
-            return None, None
-
-        audio_codes = revert_delay_pattern(token) \
-                      .clip(0, self.audio_codebook_size - 1)
-        # Remove the very first audio bos token from the input token
-        if is_first_chunk:
-            audio_codes = audio_codes[:, 1:]
-            audio_chunk_size -= 1
-
-        tts_speech, _ = self.audio_tokenizer.decode(vq_code=audio_codes)
-        if fade_out_audio is not None:
-            hamming_window_len = min(2 * len(fade_out_audio),
-                                     self.hamming_window_len)
-            hamming_window = _get_hamming_window(hamming_window_len)
-            fade_overlap_len = hamming_window_len // 2
-            tts_speech[:fade_overlap_len] = tts_speech[:fade_overlap_len] * hamming_window[:fade_overlap_len] + \
-                fade_out_audio[:fade_overlap_len] * hamming_window[fade_overlap_len:]
-
-        fade_out_audio = tts_speech[audio_chunk_size * self.samples_per_token:]
-        if not finalize:
-            tts_speech = tts_speech[:audio_chunk_size * self.samples_per_token]
-        else:
-            fade_out_audio = None
-        return tts_speech, fade_out_audio
 
     def _should_stream_with_auto_tool_parsing(self,
                                               request: ChatCompletionRequest):

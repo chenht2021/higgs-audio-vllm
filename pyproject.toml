@@ -146,8 +146,8 @@ exclude = [
 ]
 
 [tool.codespell]
-ignore-words-list = "dout, te, indicies, subtile, ElementE"
-skip = "tests/models/fixtures/*,tests/prompts/*,benchmarks/sonnet.txt,tests/lora/data/*,build/*,vllm/third_party/*"
+ignore-words-list = "dout, te, indicies, subtile, ElementE, revered"
+skip = "tests/models/fixtures/*,tests/prompts/*,benchmarks/sonnet.txt,tests/lora/data/*,build/*,vllm/third_party/*,vllm/entrypoints/bosonai/voice_presets/config.json"
 
 [tool.isort]
 use_parentheses = true

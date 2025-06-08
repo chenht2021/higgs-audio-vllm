@@ -15,6 +15,7 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from threading import Thread
 from typing import Optional, get_args
 
 import uvloop
@@ -30,8 +31,10 @@ import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, nullable_str
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.bosonai.serving_audio import (HiggsAudioServingAudio,
+                                                    load_voice_presets)
 # yapf: enable
-from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServeEngine
+from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServingChat
 from vllm.entrypoints.chat_utils import (load_chat_template,
                                          resolve_hf_chat_template,
                                          resolve_mistral_chat_template)
@@ -43,7 +46,8 @@ from vllm.entrypoints.openai.cli_args import (ChatTemplateContentFormatOption,
                                               validate_parsed_serve_args)
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
+from vllm.entrypoints.openai.protocol import (AudioSpeechRequest,
+                                              ChatCompletionRequest,
                                               ChatCompletionResponse,
                                               ErrorResponse)
 from vllm.entrypoints.openai.serving_models import (BaseModelPath,
@@ -152,8 +156,16 @@ def models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
 
 
-def chat(request: Request) -> Optional[HiggsAudioServeEngine]:
+def chat(request: Request) -> Optional[HiggsAudioServingChat]:
     return request.app.state.openai_serving_chat
+
+
+def audio(request: Request) -> Optional[HiggsAudioServingAudio]:
+    return request.app.state.openai_serving_audio
+
+
+def voice_presets(request: Request) -> Optional[dict]:
+    return request.app.state.voice_presets
 
 
 @asynccontextmanager
@@ -377,7 +389,7 @@ async def init_app_state(
         prompt_adapters=args.prompt_adapters,
     )
     await state.openai_serving_models.init_static_loras()
-    state.openai_serving_chat = HiggsAudioServeEngine(
+    state.openai_serving_chat = HiggsAudioServingChat(
         engine_client,
         model_config,
         state.openai_serving_models,
@@ -393,9 +405,27 @@ async def init_app_state(
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         audio_tokenizer=audio_tokenizer,
     ) if model_config.runner_type == "generate" else None
+    state.openai_serving_audio = HiggsAudioServingAudio(
+        engine_client,
+        model_config,
+        state.openai_serving_models,
+        voice_presets_dir=args.voice_presets_dir,
+        request_logger=request_logger,
+        chat_template_content_format=args.chat_template_content_format,
+        audio_tokenizer=audio_tokenizer,
+    ) if model_config.runner_type == "generate" else None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+
+    state.voice_presets = {}
+    update_voice_presets_thd = Thread(
+        target=load_voice_presets,
+        args=(state, args.voice_presets_dir,
+              args.voice_presets_refresh_interval),
+        daemon=True,
+    )
+    update_voice_presets_thd.start()
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
@@ -509,6 +539,33 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/v1/audio/speech",
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_audio_speech(request: AudioSpeechRequest,
+                              raw_request: Request):
+    handler = audio(raw_request)
+
+    generator = await handler.create_audio_speech_stream(
+        request,
+        voice_presets=voice_presets(raw_request),
+        raw_request=raw_request,
+    )
+
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content=generator.model_dump(),
+                            status_code=generator.code)
+
+    return StreamingResponse(content=generator, media_type="audio/mpeg")
+
+
+@router.get("/v1/audio/voices")
+async def get_audio_voices(raw_request: Request):
+    voices = voice_presets(raw_request).keys()
+    return list(voices)
 
 
 def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -682,6 +739,15 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
                         type=nullable_str,
                         default=None,
                         help="The path to the audio tokenizer to use. ")
+    parser.add_argument("--voice-presets-dir",
+                        type=nullable_str,
+                        default=os.path.join(os.path.dirname(__file__),
+                                             "./voice_presets/"),
+                        help="The path to the voice presets directory. ")
+    parser.add_argument("--voice-presets-refresh-interval",
+                        type=int,
+                        default=10,
+                        help="The interval to refresh the voice presets. ")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
 

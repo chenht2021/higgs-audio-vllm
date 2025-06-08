@@ -1,0 +1,19 @@
+{
+    "en_man_1": {
+        "transcript": "Maintaining your ability to learn translates into increased marketability, improved career options and higher salaries.",
+        "audio_file": "en_man_1.wav"
+    },
+    "en_woman_1": {
+        "transcript": "The device would work during the day as well, if you took steps to either block direct sunlight or point it away from the sun.",
+        "audio_file": "en_woman_1.wav"
+    },
+    "zh_man_1": {
+        "transcript": "对，这就是我，万人敬仰的太乙真人，虽然有点婴儿肥，但也掩不住我逼人的帅气。",
+        "audio_file": "zh_man_1.wav"
+    },
+    "hogwarts_v3": {
+        "transcript": "I would imagine so. A wand with a dragon heartstring core is capable of dazzling magic.",
+        "audio_file": "hogwarts_v3.wav",
+        "system_prompt": "The style of the voice actor:\n\nA master wandmaker with an enigmatic presence, Gerbold Ollivander is renowned for crafting wands that have unparalleled compatibility with their owners. His keen intuition allows him to discern the perfect magical core for each aspiring witch or wizard, making his shop in Diagon Alley a revered destination for those embarking on their magical journey."
+    }
+}
