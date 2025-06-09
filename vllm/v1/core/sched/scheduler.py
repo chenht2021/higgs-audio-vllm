@@ -641,7 +641,8 @@ class Scheduler(SchedulerInterface):
                     del new_token_ids[num_new:]  # Trim new tokens if needed.
                     break
 
-            if model_runner_output.sampled_mm_token_ids is not None:
+            if (len(new_token_ids) > 0
+                    and model_runner_output.sampled_mm_token_ids is not None):
                 new_mm_token_ids = model_runner_output.sampled_mm_token_ids[
                     req_index]
                 # Append the generated mm tokens to the request and

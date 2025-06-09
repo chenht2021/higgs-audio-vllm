@@ -1770,10 +1770,7 @@ class AudioSpeechRequest(OpenAIBaseModel):
 
     stop: Optional[list[str]] = None
 
-    max_tokens: Optional[int] = Field(
-        default=None,
-        description=
-        "Compatibility field for max_tokens. Not configurable by users.")
+    max_tokens: Optional[int] = None
 
     audio_chunk_size: Optional[int] = None
     """ The size of the audio chunk """
@@ -1786,5 +1783,5 @@ class AudioSpeechRequest(OpenAIBaseModel):
             temperature=self.temperature,
             top_p=self.top_p,
             stop=['<|eot_id|>', '<|end_of_text|>'],
-            max_tokens=None,
+            max_tokens=self.max_tokens,
             output_kind=RequestOutputKind.DELTA)
