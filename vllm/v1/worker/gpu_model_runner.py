@@ -31,6 +31,7 @@ from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         SlidingWindowSpec)
+from vllm.v1.multimodal.metadata import MultimodalMetadata
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -344,6 +345,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 output_mm_token_ids=[],
+                num_audio_eos=0,
+                num_audio_delays=0,
                 lora_request=new_req_data.lora_request,
             )
 
@@ -390,6 +393,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_new_tokens = (num_computed_tokens +
                               len(req_data.new_token_ids) -
                               req_state.num_tokens)
+
+            # mm related updates
+            req_state.num_audio_eos = req_data.num_audio_eos
+            req_state.num_audio_delays = req_data.num_audio_delays
+
             if num_new_tokens == 1:
                 # Avoid slicing list in most common case.
                 req_state.output_token_ids.append(req_data.new_token_ids[-1])
@@ -469,7 +477,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> tuple[FlashAttentionMetadata, torch.Tensor,
-               Optional[SpecDecodeMetadata]]:
+               Optional[SpecDecodeMetadata], Optional[MultimodalMetadata]]:
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -623,7 +631,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.lora_config:
             self.set_active_loras(self.input_batch, num_scheduled_tokens)
 
-        return attn_metadata, logits_indices, spec_decode_metadata
+        multimodal_metadata = self._calc_multimodal_metadata(scheduler_output)
+
+        return (attn_metadata, logits_indices, spec_decode_metadata,
+                multimodal_metadata)
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -760,6 +771,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
                 mrope_pos_ptr += completion_part_len
+
+    def _calc_multimodal_metadata(self, scheduler_output: "SchedulerOutput"):
+        num_audio_eos: list[int] = []
+        num_audio_delays: list[int] = []
+        last_prompt_token_ids: list[int] = []
+        audio_generation_mode: list[int] = []
+        for req_id in self.input_batch.req_ids:
+            req = self.requests[req_id]
+            num_audio_eos.append(req.num_audio_eos)
+            num_audio_delays.append(req.num_audio_delays)
+            last_prompt_token_ids.append(req.prompt_token_ids[-1])
+
+        return MultimodalMetadata(
+            num_audio_eos=num_audio_eos,
+            num_audio_delays=num_audio_delays,
+            audio_generation_mode=audio_generation_mode,
+            last_prompt_token_ids=last_prompt_token_ids,
+        )
 
     def _calc_spec_decode_metadata(
         self,
@@ -966,8 +995,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 encoder_outputs.append(encoder_output[start_idx:end_idx])
 
             # HACK: Append the output mm token ids to here
-            if req_id in self.encoder_cache and -1 in self.encoder_cache[
-                    req_id]:
+            if (req_id in self.encoder_cache
+                    and req_id in scheduler_output.scheduled_encoder_inputs and
+                    -1 in scheduler_output.scheduled_encoder_inputs[req_id]):
                 encoder_outputs.append(self.encoder_cache[req_id][-1])
 
         return encoder_outputs
@@ -1041,8 +1071,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             encoder_outputs = []
 
         # Prepare the decoder inputs.
-        attn_metadata, logits_indices, spec_decode_metadata = (
-            self._prepare_inputs(scheduler_output))
+        attn_metadata, logits_indices, spec_decode_metadata, \
+            multimodal_metadata = self._prepare_inputs(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
@@ -1118,10 +1148,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
-            sampler_output = self.model.sample(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
+            if hasattr(self.model, "sample_with_multimodal_metadata"):
+                sampler_output = self.model.sample_with_multimodal_metadata(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                    multimodal_metadata=multimodal_metadata,
+                )
+            else:
+                sampler_output = self.model.sample(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
             if isinstance(sampler_output, tuple):
                 sampler_output, mm_sampler_output = sampler_output
             else:
@@ -1530,8 +1567,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         try:
             if mm_logits is not None:
                 logits = (logits, mm_logits)
-            sampler_output = self.model.sample(
-                logits=logits, sampling_metadata=dummy_metadata)
+            if hasattr(self.model, "sample_with_multimodal_metadata"):
+                dummy_mm_metadata = MultimodalMetadata(
+                    num_audio_eos=[0] * num_reqs,
+                    num_audio_delays=[0] * num_reqs,
+                    audio_generation_mode=[0] * num_reqs,
+                    last_prompt_token_ids=[0] * num_reqs,
+                )
+                sampler_output = self.model.sample_with_multimodal_metadata(
+                    logits=logits,
+                    sampling_metadata=dummy_metadata,
+                    multimodal_metadata=dummy_mm_metadata)
+            else:
+                sampler_output = self.model.sample(
+                    logits=logits, sampling_metadata=dummy_metadata)
         except RuntimeError as e:
             if 'out of memory' in str(e):
                 raise RuntimeError(

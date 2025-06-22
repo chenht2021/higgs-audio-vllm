@@ -5,7 +5,7 @@ import os
 import tempfile
 import warnings
 from enum import Enum
-from functools import cache
+from functools import lru_cache
 from typing import Optional, Union
 
 import boto3
@@ -20,6 +20,10 @@ MODEL_INFO = {
     "dac_16k": {
         "path": "descript/dac_16khz",
         "tps": 16000 / 320,
+    },
+    "dac_24k": {
+        "path": "descript/dac_24khz",
+        "tps": 24000 / 512,
     },
     "dac_44k": {
         "path": "descript/dac_44khz",
@@ -44,7 +48,55 @@ MODEL_INFO = {
         "num_codebooks": 8,
         "codebook_size": 1024,
     },
-
+    # First tokenizer with 24kHz sampling rate.
+    "xcodec_0418_exp_2": {
+        "path": "s3://data/audio_tokenizer/xcodec_tps25_24k/0418_exp_2",
+        "tps": 25,
+        "sampling_rate": 24000,
+        "num_codebooks": 8,
+        "codebook_size": 1024,
+    },
+    # Increase TPS to 50.
+    "xcodec_0507_exp_1": {
+        "path": "s3://data/audio_tokenizer/xcodec_tps50_24k/0507_exp_1",
+        "tps": 50,
+        "sampling_rate": 24000,
+        "num_codebooks": 8,
+        "codebook_size": 1024,
+    },
+    # Applying downprojection during codebook lookup, best 50TPS so far (25/05/28).
+    "xcodec_0513_exp_3": {
+        "path": "s3://data/audio_tokenizer/xcodec_tps50_24k/0513_exp_3",
+        "tps": 50,
+        "sampling_rate": 24000,
+        "num_codebooks": 8,
+        "codebook_size": 1024,
+    },
+    # Applying downprojection during codebook lookup for 25TPS.
+    "xcodec_0516_exp_1": {
+        "path": "s3://data/audio_tokenizer/xcodec_tps25_24k/0516_exp_1",
+        "tps": 25,
+        "sampling_rate": 24000,
+        "num_codebooks": 8,
+        "codebook_size": 1024,
+    },
+    # Reducing number of codebooks to 4.
+    "xcodec_0521_exp_6": {
+        "path": "s3://data/audio_tokenizer/xcodec_tps50_24k/0521_exp_6",
+        "tps": 25,
+        "sampling_rate": 24000,
+        "num_codebooks": 4,
+        "codebook_size": 1024,
+    },
+    # Using whisper as semantic teacher.
+    "xcodec_0501_exp_3_whisper": {
+        "path":
+        "s3://data/audio_tokenizer/xcodec_tps25_24k/0501_exp_3_whisper",
+        "tps": 25,
+        "sampling_rate": 24000,
+        "num_codebooks": 8,
+        "codebook_size": 1024,
+    },
     # For xcodec2, we save the pt file directly
     "xcodec2_tps50": {
         "path":
@@ -118,7 +170,7 @@ class AudioTokenizerType(Enum):
 
 
 # Brought from https://github.com/openai/whisper/blob/517a43ecd132a2089d85f4ebc044728a71d49f6e/whisper/audio.py#L91-L92
-@cache
+@lru_cache(maxsize=None)
 def mel_filters(device, n_mels: int) -> torch.Tensor:
     """
     load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
@@ -249,11 +301,15 @@ class AudioTokenizer:
 
                     self.audio_tokenizer_model = load_codec_model(
                         os.path.join(tmp_dir, "config.yaml"),
-                        os.path.join(tmp_dir, "model.pth"))
+                        os.path.join(tmp_dir, "model.pth"),
+                        device=device,
+                    )
             else:
                 self.audio_tokenizer_model = load_codec_model(
                     os.path.join(model_path, "config.yaml"),
-                    os.path.join(model_path, "model.pth"))
+                    os.path.join(model_path, "model.pth"),
+                    device=device,
+                )
             self._sampling_rate = MODEL_INFO[model]["sampling_rate"]
             self.audio_tokenizer_feature_extractor = XCodecFeatureExtractor(
                 sampling_rate=self._sampling_rate)

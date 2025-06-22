@@ -162,7 +162,7 @@ class HiggsAudioServingChat(OpenAIServing):
                         "{{ content }}"
                     "{% endfor %}"
                     "{% if add_generation_prompt %}"
-                        "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|><|AUDIO_OUT|>' }}"
+                        "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|>' }}"
                     "{% endif %}"
                 )
             # fmt: on

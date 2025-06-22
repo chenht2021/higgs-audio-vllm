@@ -81,9 +81,9 @@ class Request:
         # Stats for the delay pattern
         # HACK!! TODO: read audio_num_codebooks from model config
         self._use_delay_pattern = True
-        self._num_audio_eos = 0
-        self._num_audio_delays = 0
-        self._audio_num_codebooks: Optional[int] = None
+        self.num_audio_eos = 0
+        self.num_audio_delays = 0
+        self.audio_num_codebooks: Optional[int] = None
 
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "Request":
@@ -119,26 +119,27 @@ class Request:
         mm_bos_token_id: int,
         mm_eos_token_id: int,
     ) -> None:
+        if mm_token_ids[0] == -1:
+            # Means we reached the end of the audio stream.
+            self.num_audio_eos = 0
+            self.num_audio_delays = 0
+            self._output_mm_token_ids = []
+            self.output_mm_token_ids = ConstantList(self._output_mm_token_ids)
+            return
+
         self._output_mm_token_ids.append(mm_token_ids)
         # Initialize audio codebooks if not already set
-        if self._audio_num_codebooks is None:
-            self._audio_num_codebooks = len(mm_token_ids)
+        if self.audio_num_codebooks is None:
+            self.audio_num_codebooks = len(mm_token_ids)
 
-        # HACK: Check the delay pattern here.
-        # TODO: Move this to the sampler.
-        if self._num_audio_delays < self._audio_num_codebooks:
-            self._output_mm_token_ids[-1][self._num_audio_delays + 1:] = \
-                [mm_bos_token_id] * (self._audio_num_codebooks - \
-                                     self._num_audio_delays - 1)
-            self._num_audio_delays += 1
-        elif self._num_audio_eos < self._audio_num_codebooks:
+        if self.num_audio_delays < self.audio_num_codebooks:
+            self.num_audio_delays += 1
+        elif self.num_audio_eos < self.audio_num_codebooks:
             mm_token_ids_np = np.array(mm_token_ids)
             all_eos_indices = np.where(mm_token_ids_np == mm_eos_token_id)[0]
             if len(all_eos_indices) > 0:
                 last_eos_index = all_eos_indices[-1]
-                self._output_mm_token_ids[-1][:last_eos_index] = \
-                    [mm_eos_token_id] * last_eos_index
-                self._num_audio_eos = last_eos_index + 1
+                self.num_audio_eos = last_eos_index + 1
 
     @property
     def num_tokens(self) -> int:

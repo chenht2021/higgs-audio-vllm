@@ -135,6 +135,7 @@ class HiggsAudioConfig(PretrainedConfig):
         audio_stream_eos_id=1025,
         audio_bos_token="<|audio_bos|>",
         audio_eos_token="<|audio_eos|>",
+        audio_eos_token_idx=128012,
         audio_out_bos_token="<|audio_out_bos|>",
         audio_out_bos_token_idx=128013,
         audio_in_token="<|AUDIO|>",
@@ -185,6 +186,7 @@ class HiggsAudioConfig(PretrainedConfig):
         self.audio_codebook_size = audio_codebook_size
         self.audio_bos_token = audio_bos_token
         self.audio_eos_token = audio_eos_token
+        self.audio_eos_token_idx = audio_eos_token_idx
         self.audio_out_bos_token = audio_out_bos_token
         self.audio_out_bos_token_idx = audio_out_bos_token_idx
         self.audio_in_token = audio_in_token

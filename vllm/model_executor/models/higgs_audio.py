@@ -51,6 +51,7 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         PromptUpdate, PromptUpdateDetails)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.sequence import IntermediateTensors
+from vllm.v1.multimodal.metadata import MultimodalMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from .higgs_audio_config import HiggsAudioConfig, HiggsAudioEncoderConfig
@@ -1519,54 +1520,12 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
         multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
-        found_audio_out_bos = False
-        if self.generate_audio_out_token:
-            # Find all the position in input_ids that has single audio_out_token_idx,
-            # and set the embedding of the audio_out_token_idx to 0.
-            audio_out_token_idx = self.config.audio_out_token_idx
-            audio_out_bos_token_idx = self.config.audio_out_bos_token_idx
-
-            # Create a mask for positions where the token is audio_out_token_idx
-            audio_out_token_idx_mask = input_ids == audio_out_token_idx
-
-            # Create a mask for positions where the previous token is audio_stream_bos_id
-            # First, create a shifted version of input_ids where each position contains previous token
-            # Use padding for the first position
-            prev_tokens = torch.cat([
-                torch.full(
-                    (1, ), -1, dtype=input_ids.dtype, device=input_ids.device),
-                input_ids[:-1]
-            ],
-                                    dim=0)
-
-            # Create a mask for positions where the previous token is audio_stream_bos_id
-            prev_is_audio_bos_mask = prev_tokens == audio_out_bos_token_idx
-
-            # Combine the two masks to get positions where current token is audio_out_token_idx
-            # and previous token is audio_stream_bos_id
-            combined_mask = audio_out_token_idx_mask & prev_is_audio_bos_mask
-
-            audio_out_start_token = \
-                torch.full((self.audio_num_codebooks, 1), self.config.audio_stream_bos_id, dtype=torch.long, device=input_ids.device)
-
-            # Only set embeddings for positions that match both conditions
-            if combined_mask.any():
-                inputs_embeds[combined_mask, :] = \
-                    self._embed_audio_ids(audio_out_start_token)
-                input_ids[combined_mask] = -1
-                found_audio_out_bos = True
-
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings, [
                     self.config.audio_in_token_idx,
                     self.config.audio_out_token_idx
                 ])
-
-        if self.generate_audio_out_token:
-            # Revert the input_ids to the original input_ids
-            if found_audio_out_bos:
-                input_ids[combined_mask] = self.config.audio_out_token_idx
 
         return inputs_embeds
 
@@ -1628,8 +1587,7 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                                             sampling_metadata)
         if self.generate_audio_out_token:
             audio_logits = self.audio_logits_processor(self.audio_lm_head,
-                                                       hidden_states,
-                                                       sampling_metadata)
+                                                       hidden_states, None)
             audio_logits = audio_logits.view(-1, self.audio_num_codebooks,
                                              self.audio_codebook_size).float()
         else:
@@ -1638,13 +1596,42 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def sample(self, logits: torch.Tensor,
                sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+        raise NotImplementedError("Not implemented")
+
+    def sample_with_multimodal_metadata(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        multimodal_metadata: MultimodalMetadata,
+    ) -> Optional[SamplerOutput]:
         if isinstance(logits, tuple):
             logits, audio_logits = logits
         else:
             audio_logits = None
         next_tokens = self.sampler(logits, sampling_metadata)
         next_mm_tokens = None
+        n_reqs = logits.shape[0]
+
+        # Check which stage we are in
+        # 0: text generation mode
+        # 1: audio generation mode initialization
+        # 2: audio generation mode in progress
+        audio_generation_mode = [0] * n_reqs
         if self.generate_audio_out_token:
+            for i in range(n_reqs):
+                last_prompt_token_id = multimodal_metadata.last_prompt_token_ids[
+                    i]
+                output_token_ids = sampling_metadata.output_token_ids[i]
+                if (len(output_token_ids) > 0 and output_token_ids[-1] == self.config.audio_out_bos_token_idx) or \
+                    (len(output_token_ids) == 0 and last_prompt_token_id == self.config.audio_out_bos_token_idx):
+                    # check if the previous token is audio_out_bos. If so, we should always generate <|AUDIO_OUT|>
+                    # Start the audio generation mode
+                    audio_generation_mode[i] = 1
+                elif len(output_token_ids) > 0 and output_token_ids[
+                        -1] == self.config.audio_out_token_idx:
+                    # Still in the audio generation mode
+                    audio_generation_mode[i] = 2
+
             assert audio_logits is not None
             audio_logits = audio_logits.reshape(-1, self.audio_codebook_size)
             mm_sampling_metadata = \
@@ -1654,9 +1641,43 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 next_mm_tokens.sampled_token_ids.reshape(
                     -1, self.audio_num_codebooks)
 
-            # HACK: Force the next text token to be the <|AUDIO_OUT|>.
-            next_tokens.sampled_token_ids = \
-                torch.full_like(next_tokens.sampled_token_ids, self.config.audio_out_token_idx)
+            # Check if we are generating the audio tokens
+            for i in range(n_reqs):
+                if audio_generation_mode[i] == 1:
+                    # Generate start of the audio stream
+                    next_tokens.sampled_token_ids[
+                        i] = self.config.audio_out_token_idx
+                    next_mm_tokens.sampled_token_ids[
+                        i] = self.config.audio_stream_bos_id
+                elif audio_generation_mode[i] == 2:
+                    next_tokens.sampled_token_ids[
+                        i] = self.config.audio_out_token_idx
+                    # Update the next mm tokens based on the delay pattern
+                    num_audio_delay = multimodal_metadata.num_audio_delays[i]
+                    num_audio_eos = multimodal_metadata.num_audio_eos[i]
+
+                    # Generate the delayed for the first few tokens
+                    if num_audio_delay < self.audio_num_codebooks:
+                        next_mm_tokens.sampled_token_ids[i][num_audio_delay:] = \
+                            self.config.audio_stream_bos_id
+
+                    # Generate the eos token for the last few tokens
+                    if num_audio_eos < self.audio_num_codebooks:
+                        all_eos_indices = \
+                            torch.where(next_mm_tokens.sampled_token_ids[i] == self.config.audio_stream_eos_id)[0]
+                        if all_eos_indices.shape[0] > 0:
+                            last_eos_index = all_eos_indices[-1]
+                            next_mm_tokens.sampled_token_ids[i][:last_eos_index] = \
+                                self.config.audio_stream_eos_id
+                    elif num_audio_eos == self.audio_num_codebooks:
+                        # We already generated the last audio token,
+                        # so we should just generate the eos token for the text
+                        next_tokens.sampled_token_ids[
+                            i] = self.config.audio_eos_token_id
+                        next_mm_tokens.sampled_token_ids[i] = -1
+                else:
+                    next_mm_tokens.sampled_token_ids[i] = -1
+
         return next_tokens, next_mm_tokens
 
     def prepare_mm_sampling_metadata(

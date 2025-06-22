@@ -59,7 +59,7 @@ AUDIO_OUT_CHAT_TEMPLATE = (
     "{{ content }}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
-    "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|><|AUDIO_OUT|>' }}"
+    "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|>' }}"
     "{% endif %}")
 # fmt: on
 
@@ -236,9 +236,10 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline):
     ]
     model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
     llm = LLM(model=model_path, max_model_len=1024)
-    sampling_params = SamplingParams(temperature=0.7,
-                                     max_tokens=500,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"])
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        max_tokens=500,
+        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"])
 
     outputs = llm.chat(
         conversations,
@@ -260,7 +261,7 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline):
         reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
         decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
         asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        # sf.write(f"audio_out_{i}.wav", decoded_audio, sr)
+        sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
         reference += clean_punctuation(speech_samples[i]).lower()
         hypothesis += clean_punctuation(asr_text).lower()
 
@@ -287,9 +288,10 @@ def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
     ]
     model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
     llm = LLM(model=model_path, max_model_len=1024)
-    sampling_params = SamplingParams(temperature=0.7,
-                                     max_tokens=500,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"])
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        max_tokens=500,
+        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"])
 
     outputs = llm.chat(
         conversations,
@@ -309,7 +311,7 @@ def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
         reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
         decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
         asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
+        sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
         reference += clean_punctuation(speech_samples[i]).lower()
         hypothesis += clean_punctuation(asr_text).lower()
 
@@ -373,9 +375,10 @@ def test_audio_tts_dialogue(speech_samples, dialogue_sample_1, asr_pipeline):
     llm = LLM(model=model_path,
               max_model_len=1024,
               limit_mm_per_prompt={"audio": 50})
-    sampling_params = SamplingParams(temperature=0.7,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"],
-                                     max_tokens=512)
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
+        max_tokens=512)
 
     batch_size = 20
     conversations = []
@@ -452,9 +455,10 @@ def test_audio_in_text_out():
             ],
         },
     ]
-    sampling_params = SamplingParams(temperature=0,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"],
-                                     max_tokens=512)
+    sampling_params = SamplingParams(
+        temperature=0,
+        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
+        max_tokens=512)
     outputs = llm.chat(
         conversation,
         sampling_params=sampling_params,
@@ -525,7 +529,7 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
             model="higgs_audio",
             max_completion_tokens=500,
             temperature=0.7,
-            stop=["<|eot_id|>", "<|end_of_text|>"],
+            stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
             modalities=["audio", "text"])
         output = await serving_chat.create_chat_completion(request_json)
         return output
@@ -545,8 +549,8 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline):
     hypothesis = ""
     for i, output in enumerate(outputs):
         audio_data = base64.b64decode(output.choices[0].message.audio.data)
-        with open(f"audio_dumps/audio_out_{i}.wav", "wb") as f:
-            f.write(audio_data)
+        # with open(f"audio_dumps/audio_out_{i}.wav", "wb") as f:
+        #     f.write(audio_data)
         audio_stream = io.BytesIO(audio_data)
         decoded_audio, sr = sf.read(audio_stream, dtype='int16')
         asr_text = _get_asr(decoded_audio.astype(np.float32), sr, asr_pipeline)
@@ -615,7 +619,7 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
             max_completion_tokens=500,
             top_p=0.95,
             temperature=1,
-            stop=["<|eot_id|>", "<|end_of_text|>"],
+            stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
             stream=True,
             modalities=["audio", "text"])
         audio_bytes_io = io.BytesIO()
@@ -768,3 +772,90 @@ async def test_audio_speech_api(speech_samples, asr_pipeline):
     wer = jiwer.wer(reference, hypothesis)
     print(f"WER: {wer}")
     assert wer < 0.05
+
+
+def prepare_text_audio_interleave_sample():
+    system_prompt = """Generate audio following instruction.
+<|scene_desc_start|>
+SPEAKER0: vocal fry;moderate pitch;monotone;masculine;young adult;slightly fast
+SPEAKER1: masculine;moderate;moderate pitch;monotone;mature
+In this scene, a group of adventurers is debating whether to investigate a potentially dangerous situation.
+<|scene_desc_end|>"""
+    return [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role":
+            "user",
+            "content":
+            "<|generation_instruction_start|>\nGenerate interleaved transcript and audio that lasts for around 10 seconds.\n<|generation_instruction_end|>",
+        },
+    ]
+
+
+def split_interleaved_delayed_audios(audio_data: list[list[int]],
+                                     audio_tokenizer: AudioTokenizer):
+    separator = [1025] * audio_tokenizer.num_codebooks
+    groups = []
+    current = []
+    for row in audio_data:
+        current.append(row)
+        if row == separator:
+            groups.append(current)
+            current = []
+    # Don't forget the last group if there's no trailing separator
+    if current:
+        groups.append(current)
+
+    return groups
+
+
+def test_audio_text_audio_interleave():
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
+    audio_tokenizer_type = "xcodec_0507_exp_1"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps50_0507_exp1/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+
+    batch_size = 1
+    conversations = [
+        prepare_text_audio_interleave_sample() for _ in range(batch_size)
+    ]
+
+    model_path = os.path.join(TEST_MODEL_PATH,
+                              "higgs_audio_interleave_3b_202505013")
+    llm = LLM(model=model_path, max_model_len=2048)
+    sampling_params = SamplingParams(temperature=1.0,
+                                     max_tokens=1024,
+                                     top_p=0.95,
+                                     top_k=50,
+                                     stop=["<|eot_id|>", "<|end_of_text|>"])
+
+    outputs = llm.chat(
+        conversations,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+        chat_template=TEXT_OUT_CHAT_TEMPLATE,
+    )
+
+    audio_tokenizer = AudioTokenizer(
+        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
+
+    for i in range(len(outputs)):
+        audio_datas = split_interleaved_delayed_audios(
+            outputs[i].outputs[0].mm_token_ids, audio_tokenizer)
+        decoded_audios = []
+        for audio_data in audio_datas:
+            audio_data = np.array(audio_data).transpose(1, 0).clip(
+                0, audio_tokenizer.codebook_size - 1)
+            decoded_audio, sr = audio_tokenizer.decode(
+                revert_delay_pattern(audio_data))
+            decoded_audios.append(decoded_audio)
+        # asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
+        decoded_audio = np.concatenate(decoded_audios)
+        sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
+        print(outputs[i].outputs[0].text)

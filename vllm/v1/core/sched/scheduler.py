@@ -187,7 +187,7 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 new_encoder_budget = encoder_budget
 
-            if request.output_mm_token_ids:
+            if len(request.output_mm_token_ids) > 0:
                 # HACK: This is a hack to use -1 as the
                 # input id for the mm token id.
                 if encoder_inputs_to_schedule is None:
@@ -484,6 +484,8 @@ class Scheduler(SchedulerInterface):
             req_data.new_block_ids = new_block_ids
             req_data.num_computed_tokens = num_computed_tokens
             req_data.new_mm_token_ids = new_mm_token_ids
+            req_data.num_audio_eos = request.num_audio_eos
+            req_data.num_audio_delays = request.num_audio_delays
         else:
             req_data = CachedRequestData.from_request(request,
                                                       resumed_from_preemption,
@@ -626,6 +628,7 @@ class Scheduler(SchedulerInterface):
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
+            new_mm_token_ids: Optional[list[int]] = None
 
             # Append generated tokens and check for stop. Note that if
             # a request is still being prefilled, we expect the model runner
@@ -651,12 +654,11 @@ class Scheduler(SchedulerInterface):
                     new_mm_token_ids,
                     self.model_config.hf_config.audio_stream_bos_id,
                     self.model_config.hf_config.audio_stream_eos_id)
-                if not stopped:
-                    stopped = check_stop(request, self.max_model_len)
-                    if stopped:
-                        self._free_request(request)
-            else:
-                new_mm_token_ids = None
+
+                # If it is -1, it means we reached the end of the audio stream.
+                # Don't add the -1 to the engine core output.
+                if new_mm_token_ids[-1] == -1:
+                    new_mm_token_ids = None
 
             # Extract sample logprobs if needed.
             if request.sampling_params.logprobs is not None and logprobs:

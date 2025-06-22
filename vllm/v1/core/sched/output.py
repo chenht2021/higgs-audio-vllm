@@ -61,6 +61,8 @@ class CachedRequestData:
     new_block_ids: list[int]
     num_computed_tokens: int
     new_mm_token_ids: Optional[list[int]] = None
+    num_audio_eos: int = 0
+    num_audio_delays: int = 0
 
     @classmethod
     def from_request(
@@ -78,6 +80,8 @@ class CachedRequestData:
             num_computed_tokens=request.num_computed_tokens,
             new_mm_token_ids=request.output_mm_token_ids[-1] \
                              if request.output_mm_token_ids else None,
+            num_audio_eos=request.num_audio_eos,
+            num_audio_delays=request.num_audio_delays,
         )
 
 

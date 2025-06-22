@@ -35,6 +35,8 @@ class CachedRequestState:
     output_token_ids: list[int]
 
     output_mm_token_ids: Optional[list[list[int]]] = None
+    num_audio_eos: int = 0
+    num_audio_delays: int = 0
 
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[int] = None
