@@ -237,6 +237,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             dtype=self.dtype,
             device=self.device)
 
+        self.token_mm_map = torch.zeros(self.max_num_tokens,
+                                        dtype=torch.bool,
+                                        device=self.device)
+
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
         self.arange_np = np.arange(max(self.max_num_reqs + 1,
                                        self.max_model_len,
@@ -776,18 +780,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_audio_eos: list[int] = []
         num_audio_delays: list[int] = []
         last_prompt_token_ids: list[int] = []
-        audio_generation_mode: list[int] = []
         for req_id in self.input_batch.req_ids:
             req = self.requests[req_id]
             num_audio_eos.append(req.num_audio_eos)
             num_audio_delays.append(req.num_audio_delays)
             last_prompt_token_ids.append(req.prompt_token_ids[-1])
 
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        token_mm_map = self.model.get_input_mm_map(
+            self.input_ids[:num_scheduled_tokens])
+        self.token_mm_map[:num_scheduled_tokens] = token_mm_map
+
         return MultimodalMetadata(
             num_audio_eos=num_audio_eos,
             num_audio_delays=num_audio_delays,
-            audio_generation_mode=audio_generation_mode,
             last_prompt_token_ids=last_prompt_token_ids,
+            token_mm_map=token_mm_map,
         )
 
     def _calc_spec_decode_metadata(
@@ -1099,6 +1108,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.inputs_embeds[:num_scheduled_tokens].copy_(inputs_embeds)
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
             input_ids = None
+            if multimodal_metadata is not None:
+                multimodal_metadata.token_mm_map = self.token_mm_map[:
+                                                                     num_input_tokens]
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -1126,7 +1138,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        with set_forward_context(attn_metadata, self.vllm_config):
+        with set_forward_context(attn_metadata,
+                                 self.vllm_config,
+                                 multimodal_metadata=multimodal_metadata):
             hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -1492,9 +1506,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_multimodal_model:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds[:num_tokens]
+                dummy_mm_metadata = MultimodalMetadata(
+                    num_audio_eos=[0] * num_reqs,
+                    num_audio_delays=[0] * num_reqs,
+                    last_prompt_token_ids=[0] * num_reqs,
+                    token_mm_map=self.token_mm_map[:num_tokens],
+                )
+                torch._dynamo.mark_dynamic(dummy_mm_metadata.token_mm_map, 0)
             else:
                 input_ids = self.input_ids[:num_tokens]
                 inputs_embeds = None
+                dummy_mm_metadata = None
             if self.uses_mrope:
                 positions = self.mrope_positions[:, :num_tokens]
             else:
@@ -1516,7 +1538,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             with set_forward_context(None,
                                      self.vllm_config,
-                                     num_tokens=num_tokens):
+                                     num_tokens=num_tokens,
+                                     multimodal_metadata=dummy_mm_metadata):
                 hidden_states = model(
                     input_ids=input_ids,
                     positions=positions,
@@ -1571,8 +1594,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dummy_mm_metadata = MultimodalMetadata(
                     num_audio_eos=[0] * num_reqs,
                     num_audio_delays=[0] * num_reqs,
-                    audio_generation_mode=[0] * num_reqs,
                     last_prompt_token_ids=[0] * num_reqs,
+                    token_mm_map=torch.zeros(self.max_num_tokens,
+                                             dtype=torch.bool,
+                                             device=self.device),
                 )
                 sampler_output = self.model.sample_with_multimodal_metadata(
                     logits=logits,

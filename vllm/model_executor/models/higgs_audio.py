@@ -21,10 +21,10 @@ from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
 from transformers.tokenization_utils_base import (PaddingStrategy,
                                                   PreTokenizedInput, TextInput)
 
-from vllm.attention import AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -1063,29 +1063,27 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        fast_forward: bool = False,
-        use_audio_attention: bool = False,
     ):
         super().__init__()
         text_config = config.text_config
         self.hidden_size = text_config.hidden_size
         self.layer_idx = extract_layer_index(prefix)
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = getattr(text_config, "rope_theta", 10000)
+        rope_scaling = getattr(text_config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
-                config, "original_max_position_embeddings", None):
+                text_config, "original_max_position_embeddings", None):
             rope_scaling[
-                "original_max_position_embeddings"] = config.original_max_position_embeddings
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
-        attention_bias = getattr(config, "attention_bias", False) or getattr(
-            config, "bias", False)
+                "original_max_position_embeddings"] = text_config.original_max_position_embeddings
+        max_position_embeddings = getattr(text_config,
+                                          "max_position_embeddings", 8192)
+        attention_bias = getattr(text_config, "attention_bias",
+                                 False) or getattr(text_config, "bias", False)
         self.self_attn = LlamaAttention(
-            config=config,
+            config=text_config,
             hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(config, "num_key_value_heads",
-                                 config.num_attention_heads),
+            num_heads=text_config.num_attention_heads,
+            num_kv_heads=getattr(text_config, "num_key_value_heads",
+                                 text_config.num_attention_heads),
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
@@ -1094,10 +1092,25 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = LlamaMLP(text_config)
+        self.mlp = LlamaMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=text_config.intermediate_size,
+            hidden_act=text_config.hidden_act,
+            quant_config=quant_config,
+            bias=getattr(text_config, "mlp_bias", False),
+            prefix=f"{prefix}.mlp",
+        )
+        self.fast_forward = self.layer_idx not in config.audio_dual_ffn_layers
+        self.use_audio_attention = config.use_audio_out_self_attention
 
-        if not fast_forward:
-            if use_audio_attention:
+        if self.fast_forward or self.use_audio_attention:
+            raise NotImplementedError(
+                f"The fast-forward and audio-attention mode are not supported in "
+                f"HiggsAudioDualFFNDecoderLayer, but got fast_forward={self.fast_forward}"
+                f"and use_audio_attention={self.use_audio_attention}.")
+
+        if not self.fast_forward:
+            if self.use_audio_attention:
                 self.audio_attn = LlamaAttention(
                     config=config,
                     hidden_size=self.hidden_size,
@@ -1115,18 +1128,19 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
                 self.audio_post_audio_attn_layer_norm = RMSNorm(
                     text_config.hidden_size, eps=text_config.rms_norm_eps)
 
-            self.audio_mlp = LlamaMLP(text_config)
+            self.audio_mlp = LlamaMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=text_config.intermediate_size,
+                hidden_act=text_config.hidden_act,
+                quant_config=quant_config,
+                bias=getattr(text_config, "mlp_bias", False),
+                prefix=f"{prefix}.audio_mlp",
+            )
             self.audio_input_layernorm = RMSNorm(text_config.hidden_size,
                                                  eps=text_config.rms_norm_eps)
             self.audio_post_attention_layernorm = RMSNorm(
                 text_config.hidden_size, eps=text_config.rms_norm_eps)
 
-        self.use_audio_attention = use_audio_attention
-        self.fast_forward = fast_forward
-        if self.fast_forward:
-            assert (
-                not self.use_audio_attention
-            ), "We cannot use audio_attention if the layer is marked as fast-forward."
         self.input_layernorm = RMSNorm(text_config.hidden_size,
                                        eps=text_config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(text_config.hidden_size,
@@ -1136,102 +1150,70 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        audio_out_mask: Optional[torch.BoolTensor],
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ):
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape 
-                `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash 
-                attention is used or `(batch_size, 1, query_sequence_length, 
-                key_sequence_length)` if default attention is used.
-            position_ids
-                IDs of positions in the input sequence
-            audio_out_mask
-                Mask for identifying the audio tokens. Size (batch_size, 
-                sequence_length)
-                1 --> location contains audio_out
-                0 --> location does not contain audio_out
-
-                When use_cache is True, the audio_out_mask contains audio_out 
-                masks for all tokens up to the current token. That means, it has 
-                size (batch_size, sequence_length) while hidden_states will have 
-                size (batch_size, 1)
-            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, 
-                *optional*):
-                Tuple containing the cosine and sine positional embeddings of 
-                shape `(batch_size, seq_len, head_dim)`, with `head_dim` being 
-                the embedding dimension of each attention head.
-            kwargs (`dict`, *optional*):
-                Arbitrary kwargs to be ignored, used for FSDP and other methods 
-                that injects code into the model
-        """
         assert (
             residual is None
         ), "The residual output is not supported in HiggsAudioDualFFNDecoderLayer."
+
         residual = hidden_states
-        has_audio_out = audio_out_mask is not None and audio_out_mask.shape[
-            0] > 0
 
-        if self.fast_forward and has_audio_out:
-            original_hidden_states = hidden_states.clone()
+        # if self.fast_forward and has_audio_out:
+        #     original_hidden_states = hidden_states.clone()
 
-        if not self.fast_forward and has_audio_out:
+        audio_out_mask = get_forward_context(
+        ).multimodal_metadata.token_mm_map.unsqueeze(-1)
+        if not self.fast_forward:
             hidden_states = torch.where(
-                audio_out_mask.unsqueeze(-1),
+                audio_out_mask,
                 self.audio_input_layernorm(hidden_states),
                 self.input_layernorm(hidden_states),
             )
         else:
             hidden_states = self.input_layernorm(hidden_states)
 
-        # Audio Attention
-        if self.use_audio_attention and has_audio_out:
-            assert (
-                kv_cache.shape[0] == 4
-            ), "The KV cache should have shape (4, batch_size, seq_len, hidden_size)"
-            audio_hidden_states = self.audio_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache[2:4],
-                attn_metadata=attn_metadata,
-            )
-            audio_hidden_states = residual + audio_hidden_states
-            residual = torch.where(audio_out_mask.unsqueeze(-1),
-                                   audio_hidden_states, residual)
-            audio_hidden_states = self.audio_post_audio_attn_layer_norm(
-                audio_hidden_states)
-            hidden_states = torch.where(audio_out_mask.unsqueeze(-1),
-                                        audio_hidden_states, hidden_states)
+        # # Audio Attention
+        # if self.use_audio_attention and has_audio_out:
+        #     assert (
+        #         kv_cache.shape[0] == 4
+        #     ), "The KV cache should have shape (4, batch_size, seq_len, hidden_size)"
+        #     audio_hidden_states = self.audio_attn(
+        #         positions=positions,
+        #         hidden_states=hidden_states,
+        #         kv_cache=kv_cache[2:4],
+        #         attn_metadata=attn_metadata,
+        #     )
+        #     audio_hidden_states = residual + audio_hidden_states
+        #     residual = torch.where(audio_out_mask.unsqueeze(-1),
+        #                            audio_hidden_states, residual)
+        #     audio_hidden_states = self.audio_post_audio_attn_layer_norm(
+        #         audio_hidden_states)
+        #     hidden_states = torch.where(audio_out_mask.unsqueeze(-1),
+        #                                 audio_hidden_states, hidden_states)
 
         # Text Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache[0:2],
-            attn_metadata=attn_metadata,
         )
         hidden_states = residual + hidden_states
 
         # Apply Dual-path FFN
         residual = hidden_states
 
-        if has_audio_out and not self.fast_forward:
+        if not self.fast_forward:
+            text_hidden_states = torch.masked_fill(hidden_states,
+                                                   audio_out_mask, 0)
             text_hidden_states = self.post_attention_layernorm(
-                hidden_states[~audio_out_mask])
+                text_hidden_states)
+            audio_hidden_states = torch.masked_fill(hidden_states,
+                                                    ~audio_out_mask, 0)
             audio_hidden_states = self.audio_post_attention_layernorm(
-                hidden_states[audio_out_mask])
-
+                audio_hidden_states)
             text_hidden_states = self.mlp(text_hidden_states)
-            residual[~audio_out_mask] += text_hidden_states
-
+            residual += text_hidden_states
             audio_hidden_states = self.audio_mlp(audio_hidden_states)
-            residual[audio_out_mask] += audio_hidden_states
-
+            residual += audio_hidden_states
             hidden_states = residual
         else:
             hidden_states, residual = self.post_attention_layernorm(
@@ -1239,9 +1221,9 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-        if self.fast_forward and has_audio_out:
-            hidden_states = torch.where(audio_out_mask.unsqueeze(-1),
-                                        original_hidden_states, hidden_states)
+        # if self.fast_forward:
+        #     hidden_states = torch.where(audio_out_mask.unsqueeze(-1),
+        #                                 original_hidden_states, hidden_states)
 
         # Add a None as the residual output for the compatibility
         outputs = (hidden_states, None)
@@ -1253,7 +1235,10 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
     HiggsAudioMultiModalProcessor,
     info=HiggsAudioProcessingInfo,
     dummy_inputs=HiggsAudioDummyInputsBuilder)
-@support_torch_compile
+@support_torch_compile(dynamic_arg_dims={
+    "positions": 0,  # sequence dimension  
+    "inputs_embeds": 0,  # batch dimension
+})
 class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1282,7 +1267,7 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
             self.start_layer, self.end_layer, self.layers = make_layers(
                 config.text_config.num_hidden_layers,
                 lambda prefix: HiggsAudioDualFFNDecoderLayer(
-                    config=config.text_config,
+                    config=config,
                     cache_config=cache_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.layers",
@@ -1529,6 +1514,14 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         return inputs_embeds
 
+    def get_input_mm_map(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.isin(
+            input_ids,
+            torch.tensor([
+                self.config.audio_in_token_idx, self.config.audio_out_token_idx
+            ],
+                         device=input_ids.device))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1559,7 +1552,6 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 hidden_states, _ = layer(
                     positions=positions,
                     hidden_states=hidden_states,
-                    audio_out_mask=None,  # FIXME
                     residual=None,
                 )
             else:
@@ -1574,7 +1566,11 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if residual is not None:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            hidden_states = self.norm(hidden_states)
 
         return hidden_states
 

@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.v1.multimodal.metadata import MultimodalMetadata
 
 logger = init_logger(__name__)
 
@@ -40,6 +41,8 @@ class ForwardContext:
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
+    # set dynamically for each forward pass
+    multimodal_metadata: Optional["MultimodalMetadata"] = None
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -56,6 +59,7 @@ def get_forward_context() -> ForwardContext:
 @contextmanager
 def set_forward_context(attn_metadata: Any,
                         vllm_config: VllmConfig,
+                        multimodal_metadata: Any = None,
                         virtual_engine: int = 0,
                         num_tokens: int = 0):
     """A context manager that stores the current forward context,
@@ -97,7 +101,8 @@ def set_forward_context(attn_metadata: Any,
         static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
-        dp_metadata=dp_metadata)
+        dp_metadata=dp_metadata,
+        multimodal_metadata=multimodal_metadata)
     try:
         yield
     finally:
