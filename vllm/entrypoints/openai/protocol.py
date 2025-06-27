@@ -1782,6 +1782,6 @@ class AudioSpeechRequest(OpenAIBaseModel):
         return SamplingParams.from_optional(
             temperature=self.temperature,
             top_p=self.top_p,
-            stop=['<|eot_id|>', '<|end_of_text|>'],
+            stop=['<|eot_id|>', '<|end_of_text|>', '<|audio_eos|>'],
             max_tokens=self.max_tokens,
             output_kind=RequestOutputKind.DELTA)

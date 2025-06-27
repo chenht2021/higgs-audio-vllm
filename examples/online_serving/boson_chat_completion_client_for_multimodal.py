@@ -92,7 +92,7 @@ def run_audio_generation() -> None:
 def run_tts(stream: bool = False) -> None:
     data_dir = os.path.join(os.path.dirname(__file__), "..", "..",
                             "tests/models/decoder_only/audio_language")
-    target_rate = 16000
+    target_rate = 24000
     audio_path = os.path.join(data_dir, "en_woman_1.wav")
     audio_base64 = encode_base64_content_from_file(audio_path)
     messages = [{
@@ -134,7 +134,9 @@ def run_tts(stream: bool = False) -> None:
         max_completion_tokens=500,
         stream=stream,
         modalities=["text", "audio"],
-        temperature=0.7,
+        temperature=1.0,
+        top_p=0.95,
+        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
     )
     if stream:
         audio_bytes_io = BytesIO()
@@ -261,6 +263,70 @@ def run_generate_dialogue(stream: bool = False) -> None:
             f.write(audio_bytes)
 
 
+def run_interleave_audio_generation(stream: bool = False) -> None:
+    target_rate = 24000
+    messages = [
+        {
+            "role": "system",
+            "content": \
+                "\nGenerate audio following instruction.\n" \
+                "<|scene_desc_start|>\n" \
+                "SPEAKER0: vocal fry;monotone;slightly fast\n" \
+                "SPEAKER1: masculine;moderate;moderate pitch;mature\n" \
+                "In this scene, a group of adventurers is debating whether " \
+                "to investigate a potentially dangerous situation.\n" \
+                "<|scene_desc_end|>"
+        },
+        {
+            "role": "user",
+            "content": "<|generation_instruction_start|>\n"
+            "Generate interleaved transcript and audio that " \
+            "lasts for around 10 seconds.\n" \
+            "<|generation_instruction_end|>"
+        }
+    ]
+    chat_completion = client.chat.completions.create(
+        messages=messages,
+        model=model,
+        max_completion_tokens=1000,
+        stream=stream,
+        modalities=["text", "audio"],
+        temperature=1.0,
+        top_p=0.95,
+        stop=["<|eot_id|>", "<|end_of_text|>"],
+    )
+
+    if stream:
+        audio_bytes_io = BytesIO()
+        i = 0
+        text = ""
+        for chunk in chat_completion:
+            if chunk.choices:
+                if chunk.choices[0].delta.content is not None:
+                    text += chunk.choices[0].delta.content
+                if hasattr(chunk.choices[0].delta, 'audio') and \
+                    chunk.choices[0].delta.audio is not None:
+                    audio_bytes = base64.b64decode(
+                        chunk.choices[0].delta.audio["data"])
+                    audio_bytes_io.write(audio_bytes)
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+                    # sf.write(f"output_tts_{i}.wav", audio_data, target_rate)
+                    i += 1
+        audio_bytes_io.seek(0)
+        audio_data = np.frombuffer(audio_bytes_io.getvalue(), dtype=np.int16)
+        print("Saving the audio to file")
+        sf.write("output_interleave.wav", audio_data, target_rate)
+        print(f"Text: {text}")
+    else:
+        text = chat_completion.choices[0].message.content
+        audio = chat_completion.choices[0].message.audio.data
+        audio_bytes = base64.b64decode(audio)
+        print("Chat completion text output:", text)
+        print("Saving the audio to file")
+        with open("output_interleave.wav", "wb") as f:
+            f.write(audio_bytes)
+
+
 def main(args) -> None:
     if args.task == "tts":
         run_tts(args.stream)
@@ -270,6 +336,8 @@ def main(args) -> None:
         run_text_only()
     elif args.task == "dialogue":
         run_generate_dialogue(args.stream)
+    elif args.task == "interleave":
+        run_interleave_audio_generation(args.stream)
     else:
         raise ValueError(f"Task {args.task} not supported")
 
@@ -289,12 +357,14 @@ if __name__ == "__main__":
     parser.add_argument("--stream",
                         action="store_true",
                         help="Stream the audio.")
-    parser.add_argument(
-        "--task",
-        type=str,
-        default="tts",
-        help="Task to run.",
-        choices=["tts", "audio_generation", "text_only", "dialogue"])
+    parser.add_argument("--task",
+                        type=str,
+                        default="tts",
+                        help="Task to run.",
+                        choices=[
+                            "tts", "audio_generation", "text_only", "dialogue",
+                            "interleave"
+                        ])
     args = parser.parse_args()
 
     client = OpenAI(

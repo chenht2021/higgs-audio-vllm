@@ -204,6 +204,8 @@ class RequestState:
             mm_token_ids = self.detokenizer.output_mm_token_ids
         elif new_mm_token_ids is not None:
             mm_token_ids = [new_mm_token_ids]
+        else:
+            mm_token_ids = None
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
         if delta and logprobs:

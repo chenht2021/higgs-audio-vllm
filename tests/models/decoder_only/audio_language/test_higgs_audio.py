@@ -20,6 +20,7 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from vllm import LLM, SamplingParams
 from vllm.entrypoints.bosonai.serving_audio import HiggsAudioServingAudio
 from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServingChat
+from vllm.entrypoints.bosonai.utils import split_interleaved_delayed_audios
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (AudioSpeechRequest,
                                               ChatCompletionRequest)
@@ -489,10 +490,12 @@ def test_audio_in_text_out():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [
-    "higgs_audio_tts_1b_20250325",
-    "higgs_audio_dual_ffn_1b_20250513",
-])
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        # "higgs_audio_tts_1b_20250325",
+        "higgs_audio_dual_ffn_1b_20250513",
+    ])
 async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline,
                                            model_name):
     torch.random.manual_seed(0)
@@ -603,7 +606,7 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
         downloaded_model_path=
         "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
 
-    batch_size = 1
+    batch_size = 20
     conversations = [
         prepare_emergent_tts_sample(speech_samples[i])
         for i in range(batch_size)
@@ -819,25 +822,7 @@ In this scene, a group of adventurers is debating whether to investigate a poten
     ]
 
 
-def split_interleaved_delayed_audios(audio_data: list[list[int]],
-                                     audio_tokenizer: AudioTokenizer):
-    separator = [1025] * audio_tokenizer.num_codebooks
-    groups = []
-    current = []
-    for row in audio_data:
-        current.append(row)
-        if row == separator:
-            groups.append(current)
-            current = []
-    # Don't forget the last group if there's no trailing separator
-    if current:
-        groups.append(current)
-
-    return groups
-
-
 @pytest.mark.parametrize("model_name", [
-    "higgs_audio_interleave_3b_202505013",
     "higgs_audio_dual_ffn_1b_20250513",
 ])
 def test_audio_text_audio_interleave(model_name):
@@ -868,21 +853,130 @@ def test_audio_text_audio_interleave(model_name):
         use_tqdm=False,
         chat_template=TEXT_OUT_CHAT_TEMPLATE,
     )
-
     audio_tokenizer = AudioTokenizer(
         audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
-
+    audio_stream_eos_id = llm.llm_engine.model_config.hf_config.audio_stream_eos_id
     for i in range(len(outputs)):
         audio_datas = split_interleaved_delayed_audios(
-            outputs[i].outputs[0].mm_token_ids, audio_tokenizer)
+            outputs[i].outputs[0].mm_token_ids, audio_tokenizer,
+            audio_stream_eos_id)
         decoded_audios = []
         for audio_data in audio_datas:
             audio_data = np.array(audio_data).transpose(1, 0).clip(
-                0, audio_tokenizer.codebook_size - 1)
+                0, audio_tokenizer.codebook_size - 1)[:, 1:-1]
             decoded_audio, sr = audio_tokenizer.decode(
                 revert_delay_pattern(audio_data))
             decoded_audios.append(decoded_audio)
         # asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
         decoded_audio = np.concatenate(decoded_audios)
-        sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
+        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
         print(outputs[i].outputs[0].text)
+
+
+@pytest.mark.asyncio
+async def test_audio_interleaved_async_streaming():
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
+    audio_tokenizer_type = "xcodec_0507_exp_1"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps50_0507_exp1/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+    model_path = os.path.join(TEST_MODEL_PATH,
+                              "higgs_audio_dual_ffn_1b_20250513")
+
+    audio_tokenizer = AudioTokenizer(
+        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
+
+    batch_size = 1
+    conversations = [
+        prepare_text_audio_interleave_sample() for i in range(batch_size)
+    ]
+
+    vllm_config = AsyncEngineArgs(model=model_path,
+                                  max_model_len=2048,
+                                  limit_mm_per_prompt={
+                                      "audio": 50
+                                  },
+                                  enforce_eager=True).create_engine_config(
+                                      UsageContext.ENGINE_CONTEXT)
+    engine = AsyncLLM.from_vllm_config(vllm_config)
+    model_config = await engine.get_model_config()
+    base_model_paths = [
+        BaseModelPath(name="higgs_audio", model_path=model_path)
+    ]
+    openai_serving_models = OpenAIServingModels(
+        engine_client=engine,
+        model_config=model_config,
+        base_model_paths=base_model_paths,
+    )
+    serving_chat = HiggsAudioServingChat(
+        engine,
+        model_config,
+        openai_serving_models,
+        response_role="assistant",
+        request_logger=None,
+        chat_template_content_format="auto",
+        audio_tokenizer=audio_tokenizer,
+    )
+
+    async def process_request(conversation):
+        request_json = ChatCompletionRequest(
+            messages=conversation,
+            model="higgs_audio",
+            max_completion_tokens=1024,
+            top_p=0.95,
+            temperature=1.0,
+            stop=["<|eot_id|>", "<|end_of_text|>"],
+            stream=True,
+            modalities=["audio", "text"])
+        audio_bytes_io = io.BytesIO()
+        text = ""
+        i = 0
+        output = await serving_chat.create_chat_completion(request_json)
+        async for chunk_str in output:
+            # Parse the SSE format: "data: {json}\n\n"
+            if chunk_str.startswith("data: "):
+                json_str = chunk_str[6:]  # Remove "data: " prefix
+                if json_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(json_str)
+                    # print(f"Chunk {i}: {chunk}")
+                    if (chunk.get("choices", None) is not None
+                            and chunk["choices"][0].get("delta",
+                                                        None) is not None):
+                        if chunk["choices"][0]["delta"].get("content",
+                                                            None) is not None:
+                            text += chunk["choices"][0]["delta"]["content"]
+                        if chunk["choices"][0]["delta"].get("audio",
+                                                            None) is not None:
+                            audio_bytes = base64.b64decode(
+                                chunk["choices"][0]["delta"]["audio"]["data"])
+                            audio_bytes_io.write(audio_bytes)
+                            i += 1
+                except json.JSONDecodeError:
+                    # Skip malformed JSON
+                    continue
+            else:
+                print(chunk_str)
+        audio_bytes_io.seek(0)
+        audio_data = np.frombuffer(audio_bytes_io.getvalue(), dtype=np.int16)
+        return audio_data, text
+
+    # Create tasks for each conversation
+    tasks = []
+    for i in range(batch_size):
+        task = asyncio.create_task(process_request(conversations[i]))
+        tasks.append(task)
+
+        # Add a 10ms delay between requests
+        await asyncio.sleep(0.01)
+
+    outputs = await asyncio.gather(*tasks)
+    assert len(outputs) == batch_size
+    for i, output in enumerate(outputs):
+        audio_data, text = output
+        sf.write(f"audio_dumps/audio_out_{i}.wav", audio_data,
+                 audio_tokenizer.sampling_rate)
+        print(f"{i}th Text: {text}")

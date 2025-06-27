@@ -19,13 +19,12 @@ from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
                                          ConversationMessage)
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
-    ChatCompletionAudio, ChatCompletionModality,
-    ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
-    ChatMessage, DeltaFunctionCall, DeltaMessage, DeltaToolCall, ErrorResponse,
-    FunctionCall, FunctionDefinition, PromptTokenUsageInfo,
-    RequestResponseMetadata, ToolCall, UsageInfo)
+    ChatCompletionAudio, ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse, ChatMessage, DeltaFunctionCall, DeltaMessage,
+    DeltaToolCall, ErrorResponse, FunctionCall, FunctionDefinition,
+    PromptTokenUsageInfo, RequestResponseMetadata, ToolCall, UsageInfo)
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
                                                     clamp_prompt_logprobs)
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
@@ -39,7 +38,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import random_uuid
 
-from .utils import create_audio_chunk
+from .utils import create_audio_chunk, split_interleaved_delayed_audios
 
 logger = init_logger(__name__)
 
@@ -133,6 +132,8 @@ class HiggsAudioServingChat(OpenAIServing):
 
         self.audio_tokenizer = audio_tokenizer
         self.audio_num_codebooks = self.audio_tokenizer.num_codebooks
+        self.audio_stream_bos_id = model_config.hf_config.audio_stream_bos_id
+        self.audio_stream_eos_id = model_config.hf_config.audio_stream_eos_id
         self.audio_codebook_size = self.audio_tokenizer.codebook_size
         self.audio_tokenizer_tps = self.audio_tokenizer.tps
         self.samples_per_token = int(self.audio_tokenizer.sampling_rate //
@@ -141,47 +142,28 @@ class HiggsAudioServingChat(OpenAIServing):
             2 * self.samples_per_token
 
     # ruff: noqa: E501  # Disable specific lint rules
-    def get_chat_template(
-            self, modalities: Optional[list[ChatCompletionModality]]) -> str:
+    def get_chat_template(self) -> str:
         if self.chat_template is not None:
             return self.chat_template
 
-        if modalities is not None and "audio" in modalities:
-            # fmt: off
-            return (
-                    "{% set loop_messages = messages %}"
-                    "{% for message in loop_messages %}"
-                        "{% set content = '<|start_header_id|>' + message['role'] + "
-                        "'<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' %}"
-                        "{% if loop.index0 == 0 %}"
-                            "{% set content = bos_token + content %}"
-                        "{% endif %}"
-                        "{% if message['role'] == 'assistant' and '<|audio_bos|><|AUDIO|>' in message['content'] %}"
-                            "{% set content = content.replace('<|audio_bos|><|AUDIO|>', '<|audio_out_bos|><|AUDIO|>') %}"
-                        "{% endif %}"
-                        "{{ content }}"
-                    "{% endfor %}"
-                    "{% if add_generation_prompt %}"
-                        "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|>' }}"
-                    "{% endif %}"
-                )
-            # fmt: on
-
         # fmt: off
         return (
-            "{% set loop_messages = messages %}"
-            "{% for message in loop_messages %}"
-                "{% set content = '<|start_header_id|>' + message['role'] + "
-                "'<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' %}"
-                "{% if loop.index0 == 0 %}"
-                "{% set content = bos_token + content %}"
-            "{% endif %}"
-            "{{ content }}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}"
-                "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
-            "{% endif %}"
-        )
+                "{% set loop_messages = messages %}"
+                "{% for message in loop_messages %}"
+                    "{% set content = '<|start_header_id|>' + message['role'] + "
+                    "'<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' %}"
+                    "{% if loop.index0 == 0 %}"
+                        "{% set content = bos_token + content %}"
+                    "{% endif %}"
+                    "{% if message['role'] == 'assistant' and '<|audio_bos|><|AUDIO|>' in message['content'] %}"
+                        "{% set content = content.replace('<|audio_bos|><|AUDIO|>', '<|audio_out_bos|><|AUDIO|>') %}"
+                    "{% endif %}"
+                    "{{ content }}"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}"
+                    "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
+                "{% endif %}"
+            )
         # fmt: on
 
     async def chat_completion_stream_generator(
@@ -397,11 +379,12 @@ class HiggsAudioServingChat(OpenAIServing):
                                 audio_chunk_size,
                                 fade_out_audio[i],
                                 finalize=True,
-                                is_first_chunk=is_first_audio_chunk[i],
                                 audio_tokenizer=self.audio_tokenizer,
                                 audio_codebook_size=self.audio_codebook_size,
                                 samples_per_token=self.samples_per_token,
                                 audio_num_codebooks=self.audio_num_codebooks,
+                                audio_stream_bos_id=self.audio_stream_bos_id,
+                                audio_stream_eos_id=self.audio_stream_eos_id,
                             )
                             audio_tokens_cache[i] = np.ndarray(
                                 (0, self.audio_num_codebooks), dtype=np.int64)
@@ -427,11 +410,12 @@ class HiggsAudioServingChat(OpenAIServing):
                                 first_audio_chunk_size,
                                 fade_out_audio[i],
                                 finalize=False,
-                                is_first_chunk=True,
                                 audio_tokenizer=self.audio_tokenizer,
                                 audio_codebook_size=self.audio_codebook_size,
                                 samples_per_token=self.samples_per_token,
                                 audio_num_codebooks=self.audio_num_codebooks,
+                                audio_stream_bos_id=self.audio_stream_bos_id,
+                                audio_stream_eos_id=self.audio_stream_eos_id,
                             )
                             audio_tokens_cache[i] = audio_tokens_cache[i][
                                 first_audio_chunk_size:]
@@ -443,11 +427,12 @@ class HiggsAudioServingChat(OpenAIServing):
                                 audio_chunk_size,
                                 fade_out_audio[i],
                                 finalize=False,
-                                is_first_chunk=False,
                                 audio_tokenizer=self.audio_tokenizer,
                                 audio_codebook_size=self.audio_codebook_size,
                                 samples_per_token=self.samples_per_token,
                                 audio_num_codebooks=self.audio_num_codebooks,
+                                audio_stream_bos_id=self.audio_stream_bos_id,
+                                audio_stream_eos_id=self.audio_stream_eos_id,
                             )
                             audio_tokens_cache[i] = audio_tokens_cache[i][
                                 audio_chunk_size:]
@@ -729,11 +714,12 @@ class HiggsAudioServingChat(OpenAIServing):
                         audio_tokens_cache[i],
                         audio_chunk_size,
                         fade_out_audio[i],
-                        is_first_chunk=is_first_audio_chunk[i],
                         audio_tokenizer=self.audio_tokenizer,
                         audio_codebook_size=self.audio_codebook_size,
                         samples_per_token=self.samples_per_token,
                         audio_num_codebooks=self.audio_num_codebooks,
+                        audio_stream_bos_id=self.audio_stream_bos_id,
+                        audio_stream_eos_id=self.audio_stream_eos_id,
                         finalize=True)
                     if audio_chunk is not None:
                         delta_message = DeltaMessage(audio=audio_chunk)
@@ -826,7 +812,7 @@ class HiggsAudioServingChat(OpenAIServing):
             ]
 
             chat_template = request.chat_template or \
-                self.get_chat_template(request.modalities)
+                self.get_chat_template()
             (
                 conversation,
                 request_prompts,
@@ -994,15 +980,23 @@ class HiggsAudioServingChat(OpenAIServing):
                 reasoning_content = None
                 content = output.text
 
-            mm_token_ids = np.array(output.mm_token_ids, dtype=np.int64)
-
             # Post-process the audio tokens to audio waveform
-            if mm_token_ids is not None:
-                wv_numpy, sampling_rate = self.audio_tokenizer.decode(
-                    vq_code=revert_delay_pattern(
-                        mm_token_ids.transpose(1, 0).clip(
-                            0, self.audio_codebook_size - 1)[:, 1:-1]))
-                # audio_pcm16 = (wv_numpy * np.iinfo(np.int16).max).astype(np.int16)
+            if output.mm_token_ids is not None:
+                audio_datas = split_interleaved_delayed_audios(
+                    output.mm_token_ids, self.audio_tokenizer,
+                    self.audio_stream_eos_id)
+
+                wv_list = []
+                for audio_data in audio_datas:
+                    audio_data = np.array(audio_data, dtype=np.int64)[1:-1, :]
+                    reverted_audio_data = \
+                        revert_delay_pattern(audio_data.transpose(1, 0))
+                    reverted_audio_data = \
+                        reverted_audio_data.clip(0, self.audio_codebook_size - 1)
+                    wv, sampling_rate = self.audio_tokenizer.decode(
+                        vq_code=reverted_audio_data)
+                    wv_list.append(wv)
+                wv_numpy = np.concatenate(wv_list)
 
                 # Convert audio to base64
                 response_audio_format = "wav" if request.audio is None \
