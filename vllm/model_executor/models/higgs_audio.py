@@ -1089,6 +1089,7 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             bias=attention_bias,
+            bias_o_proj=attention_bias,
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -1618,8 +1619,8 @@ class HiggsAudioForConditionalGeneration(nn.Module, SupportsMultiModal):
                 last_prompt_token_id = multimodal_metadata.last_prompt_token_ids[
                     i]
                 output_token_ids = sampling_metadata.output_token_ids[i]
-                if (len(output_token_ids) > 0 and output_token_ids[-1] == self.config.audio_out_bos_token_idx) or \
-                    (len(output_token_ids) == 0 and last_prompt_token_id == self.config.audio_out_bos_token_idx):
+                if (len(output_token_ids) > 0 and output_token_ids[-1] == self.config.audio_out_bos_token_id) or \
+                    (len(output_token_ids) == 0 and last_prompt_token_id == self.config.audio_out_bos_token_id):
                     # check if the previous token is audio_out_bos. If so, we should always generate <|AUDIO_OUT|>
                     # Start the audio generation mode
                     audio_generation_mode[i] = 1

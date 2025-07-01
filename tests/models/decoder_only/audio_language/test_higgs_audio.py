@@ -229,21 +229,26 @@ def remove_newlines(s: str) -> str:
     return s.replace("\n", " ")
 
 
-@pytest.mark.parametrize("model_name", [
-    "higgs_audio_tts_1b_20250325",
-    "higgs_audio_dual_ffn_1b_20250513",
-])
-def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name):
+@pytest.mark.parametrize(
+    "model_name, tokenizer_type, tokenizer_path",
+    [
+        # ("higgs_audio_tts_1b_20250325", "xcodec_tps25_0215", os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
+        # ("higgs_audio_dual_ffn_1b_20250513", "xcodec_0507_exp_1", os.path.join(TEST_MODEL_PATH, "xcodec_tps50_0507_exp1")),
+        ("higgs_audio_qwen_1_5b_20250616", "xcodec_0516_exp_1",
+         os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0516_exp_1")),
+    ])
+def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
+                             tokenizer_type, tokenizer_path):
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    batch_size = 20
+    batch_size = 1
     conversations = [
         prepare_zero_shot_conversation(speech_samples[i])
         for i in range(batch_size)
     ]
     model_path = os.path.join(TEST_MODEL_PATH, model_name)
-    llm = LLM(model=model_path, max_model_len=1024)
+    llm = LLM(model=model_path, max_model_len=1024, gpu_memory_utilization=0.6)
     sampling_params = SamplingParams(
         temperature=1.0,
         top_k=50,
@@ -251,7 +256,6 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name):
         max_tokens=500,
         seed=0,
         stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"])
-
     outputs = llm.chat(
         conversations,
         sampling_params=sampling_params,
@@ -259,16 +263,8 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name):
         chat_template=AUDIO_OUT_CHAT_TEMPLATE,
     )
 
-    if model_name == "higgs_audio_dual_ffn_1b_20250513":
-        audio_tokenizer = AudioTokenizer("xcodec_0507_exp_1",
-                                         downloaded_model_path=os.path.join(
-                                             TEST_MODEL_PATH,
-                                             "xcodec_tps50_0507_exp1"))
-    else:
-        audio_tokenizer = AudioTokenizer("xcodec_tps25_0215",
-                                         downloaded_model_path=os.path.join(
-                                             TEST_MODEL_PATH,
-                                             "xcodec_tps25_0215"))
+    audio_tokenizer = AudioTokenizer(tokenizer_type,
+                                     downloaded_model_path=tokenizer_path)
 
     reference = ""
     hypothesis = ""
@@ -491,29 +487,25 @@ def test_audio_in_text_out():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "model_name",
+    "model_name, tokenizer_type, tokenizer_path",
     [
-        # "higgs_audio_tts_1b_20250325",
-        "higgs_audio_dual_ffn_1b_20250513",
+        # ("higgs_audio_tts_1b_20250325", "xcodec_tps25_0215", "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"),
+        ("higgs_audio_qwen_1_5b_20250616", "xcodec_0516_exp_1",
+         "/fsx/models/higgs_audio_test_models/xcodec_tps25_0516_exp_1/"),
+        # ("higgs_audio_dual_ffn_1b_20250513", "xcodec_0507_exp_1", "/fsx/models/higgs_audio_test_models/xcodec_tps50_0507_exp1/"),
     ])
 async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline,
-                                           model_name):
+                                           model_name, tokenizer_type,
+                                           tokenizer_path):
     torch.random.manual_seed(0)
     np.random.seed(0)
-    if model_name == "higgs_audio_dual_ffn_1b_20250513":
-        audio_tokenizer_type = "xcodec_0507_exp_1"
-        audio_tokenizer_path = os.path.join(TEST_MODEL_PATH,
-                                            "xcodec_tps50_0507_exp1")
-    else:
-        audio_tokenizer_type = "xcodec_tps25_0215"
-        audio_tokenizer_path = os.path.join(TEST_MODEL_PATH,
-                                            "xcodec_tps25_0215")
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = tokenizer_path
     model_path = os.path.join(TEST_MODEL_PATH, model_name)
 
-    audio_tokenizer = AudioTokenizer(
-        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
+    audio_tokenizer = AudioTokenizer(tokenizer_type,
+                                     downloaded_model_path=tokenizer_path)
 
     batch_size = 20
     ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
