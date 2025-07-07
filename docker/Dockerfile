@@ -99,10 +99,10 @@ RUN --mount=type=bind,source=.git,target=.git \
     if [ "$GIT_REPO_CHECK" != "0" ]; then bash tools/check_repo.sh ; fi
 
 # max jobs used by Ninja to build extensions
-ARG max_jobs=2
+ARG max_jobs=32
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
-ARG nvcc_threads=8
+ARG nvcc_threads=64
 ENV NVCC_THREADS=$nvcc_threads
 
 ARG USE_SCCACHE
@@ -142,7 +142,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # Check the size of the wheel if RUN_WHEEL_CHECK is true
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
-ARG VLLM_MAX_SIZE_MB=400
+ARG VLLM_MAX_SIZE_MB=1024
 ENV VLLM_MAX_SIZE_MB=$VLLM_MAX_SIZE_MB
 ARG RUN_WHEEL_CHECK=true
 RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
@@ -315,3 +315,19 @@ FROM vllm-openai-base AS vllm-openai
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
 #################### OPENAI API SERVER ####################
+
+
+#################### BOSONAI API SERVER ####################
+# base openai image with additional requirements, for any subsequent openai-style images
+FROM vllm-openai-base AS vllm-boson-base
+
+COPY requirements/bosonai.txt requirements/bosonai.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system -r requirements/bosonai.txt
+
+COPY third_party/xcodec xcodec
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system -e xcodec --no-deps
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.bosonai.api_server"]
+#################### BOSONAI API SERVER ####################
