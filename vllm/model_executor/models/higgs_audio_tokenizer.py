@@ -550,8 +550,10 @@ class AudioTokenizer:
                 decoded_wv = self.audio_tokenizer_model.decode(
                     audio_codes=vq_code.unsqueeze(0)).audio_values[0, 0]
             elif self.model_type == AudioTokenizerType.XCODEC:
-                decoded_wv = self.audio_tokenizer_model.decode(
-                    codes=vq_code.unsqueeze(0))[0, 0]
+                decoded_wv = \
+                    xcodec_decode_chunk_by_chunk(
+                        self.audio_tokenizer_model, vq_code.unsqueeze(0),
+                        chunk_size=1500)[0, 0]
             elif self.model_type == AudioTokenizerType.XCODEC2:
                 decoded_wv = self.audio_tokenizer_model.decode_code(
                     vq_code.unsqueeze(0))[0, 0]
@@ -624,3 +626,47 @@ class AudioTokenizer:
             else:
                 sampling_rate = self.sampling_rate
             return decoded_wv, sampling_rate
+
+
+def xcodec_get_output_length(input_length: int):
+    conv_transpose_layers = [
+        dict(kernel_size=16, stride=8, padding=4, output_padding=0),
+        dict(kernel_size=10, stride=5, padding=3, output_padding=1),
+        dict(kernel_size=8, stride=4, padding=2, output_padding=0),
+        dict(kernel_size=4, stride=2, padding=1, output_padding=0),
+        dict(kernel_size=6, stride=3, padding=2, output_padding=1),
+    ]
+    length = input_length
+    for layer in conv_transpose_layers:
+        length = (length - 1) * layer["stride"] - 2 * layer["padding"] + layer[
+            "kernel_size"] + layer["output_padding"]
+    return length
+
+
+def xcodec_decode_chunk_by_chunk(xcodec_model: torch.nn.Module,
+                                 codes: torch.Tensor,
+                                 chunk_size: int = 750):
+    overlap_width = 16
+    chunk_output_length = xcodec_get_output_length(chunk_size)
+    outputs = []
+    # split the codes into chunks, with overlap at the beginning and end
+    for i in range(0, codes.shape[-1], chunk_size):
+        begin = max(0, i - overlap_width)
+        end = min(i + chunk_size + overlap_width, codes.shape[-1])
+        chunk = codes[:, :, begin:end]
+        output = xcodec_model.decode(chunk)
+        if i == 0:
+            output = output[:, :, :chunk_output_length]
+        elif i + chunk_size >= codes.shape[-1]:
+            last_chunk_size = codes.shape[-1] - i
+            last_chunk_output_length = xcodec_get_output_length(
+                last_chunk_size)
+            output = output[:, :, -last_chunk_output_length:]
+        else:
+            extra_length = (
+                xcodec_get_output_length(chunk_size + overlap_width * 2) -
+                chunk_output_length) // 2
+            output = output[:, :, extra_length:-extra_length]
+        outputs.append(output)
+
+    return torch.cat(outputs, dim=2)

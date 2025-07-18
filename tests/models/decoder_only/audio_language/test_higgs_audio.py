@@ -972,3 +972,146 @@ async def test_audio_interleaved_async_streaming():
         sf.write(f"audio_dumps/audio_out_{i}.wav", audio_data,
                  audio_tokenizer.sampling_rate)
         print(f"{i}th Text: {text}")
+
+
+def prepare_multispeaker_sample(dialogue: str):
+    system_text = f"""As an AI assistant, your task is to convert written text into spoken words.
+    If the user's input begins with a [SPEAKER*] tag, omit the tag and create speech based on the following content using the designated voice.
+    Without a speaker tag, choose the most suitable voice for the text.
+    """
+    # Define speakers
+    ref_audio_0 = encode_base64_content_from_file("en_woman_1.wav")
+    ref_text_0 = "The device would work during the day as well, if you took steps to either block direct sunlightor point it away from the sun."
+    ref_audio_1 = encode_base64_content_from_file("en_man_1.wav")
+    ref_text_1 = "Maintaining your ability to learn translates into increased marketability, improved career options and higher salaries."
+    conversation = [{
+        "role": "system",
+        "content": system_text
+    }, {
+        "role": "user",
+        "content": "[SPEAKER_0] " + ref_text_0
+    }, {
+        "role":
+        "assistant",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": ref_audio_0,
+            }
+        }]
+    }, {
+        "role": "user",
+        "content": "[SPEAKER_1] " + ref_text_1
+    }, {
+        "role":
+        "assistant",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": ref_audio_1,
+            }
+        }]
+    }, {
+        "role": "user",
+        "content": dialogue
+    }]
+    return conversation
+
+
+@pytest.fixture(scope="module")
+def dialogue_samples():
+    with open(os.path.join(os.path.dirname(__file__), "dialogue_samples.txt"),
+              "r") as f:
+        dialogue_json = json.load(f)
+    dialogues = [dialogue["text"] for dialogue in dialogue_json["dialogues"]]
+    return dialogues
+
+
+def remove_speaker_tag(text: str) -> str:
+    return re.sub(r"\[SPEAKER\d+\]", "", text)
+
+
+def test_audio_multispeaker_voice_clone(dialogue_samples, asr_pipeline):
+    torch.random.manual_seed(0)
+    np.random.seed(0)
+
+    audio_tokenizer_type = "xcodec_0516_exp_1"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0516_exp_1/"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
+    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+
+    batch_size = 1
+    conversations = [
+        prepare_multispeaker_sample(dialogue_samples[i %
+                                                     len(dialogue_samples)])
+        for i in range(batch_size)
+    ]
+    model_path = "/fsx/workspace/xingjian/boson-multimodal/scripts/results/checkpoint_340000_train_20250616_sft_v3_lr0.0001_ga1_bs1_de1_lm0_e0_t0_au1_1_c2_ea1_ew0_cl2_tw1.0_0.95_1e-08_cos_wd0.1_10000_flash_attention_2_1_s200000_sft/checkpoint_60000"
+    llm = LLM(model=model_path,
+              max_model_len=2048,
+              limit_mm_per_prompt={"audio": 50},
+              gpu_memory_utilization=0.8)
+    sampling_params = SamplingParams(temperature=1.0,
+                                     top_p=0.95,
+                                     top_k=50,
+                                     max_tokens=500,
+                                     stop=["<|eot_id|>", "<|end_of_text|>"])
+
+    outputs = llm.chat(
+        conversations,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+        chat_template=AUDIO_OUT_CHAT_TEMPLATE,
+    )
+
+    audio_tokenizer = AudioTokenizer(
+        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
+
+    reference = ""
+    hypothesis = ""
+    for i in range(len(outputs)):
+        audio_out_ids = \
+            np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
+        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
+        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
+        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
+        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
+        reference_text = remove_speaker_tag(
+            dialogue_samples[i % len(dialogue_samples)])
+        reference_text = clean_punctuation(reference_text).lower()
+        reference += reference_text
+        hypothesis += clean_punctuation(asr_text).lower()
+
+    wer = jiwer.wer(reference, hypothesis)
+    print(f"WER: {wer}")
+    assert wer < 0.05
+
+
+def prepare_dialogue_generate_sample():
+    system_prompt = "Generate audio following instruction.\n\n<|scene_desc_start|>\nThis R&B track features a slow, sultry beat with a strong emphasis on emotional vocals. The instrumentation includes a deep bassline, soft piano chords, and atmospheric synthesizers, creating a melancholic and heartfelt atmosphere. The lyrics convey themes of love, heartbreak, and longing, making it a deeply emotional listening experience.\n<|scene_desc_end|>"
+    return [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role":
+            "user",
+            "content":
+            "<|generation_instruction_start|>\nGenerate interleaved transcript and audio that lasts for around 30 seconds.\n<|generation_instruction_end|>",
+        },
+    ]
+
+
+@pytest.mark.parametrize("input_length", [102, 1000])
+def test_xcodec_decode_chunk_by_chunk(input_length):
+    audio_tokenizer_type = "xcodec_0516_exp_1"
+    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0516_exp_1/"
+    audio_tokenizer = AudioTokenizer(
+        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
+    xcodec_model = audio_tokenizer.audio_tokenizer_model
+    codes = torch.randint(0, 1024, (1, 8, input_length)).to("cuda")
+    with torch.no_grad():
+        gold_output = xcodec_model.decode(codes)
+        output = xcodec_model.decode_chunk_by_chunk(codes, chunk_size=100)
+        torch.testing.assert_close(gold_output, output, atol=1e-4, rtol=1e-4)
