@@ -232,13 +232,14 @@ def remove_newlines(s: str) -> str:
 @pytest.mark.parametrize(
     "model_name, tokenizer_type, tokenizer_path",
     [
-        (os.path.join(TEST_MODEL_PATH,
-                      "higgs_audio_tts_1b_20250325"), "xcodec_tps25_0215",
-         os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
+        # (os.path.join(TEST_MODEL_PATH,
+        #               "higgs_audio_tts_1b_20250325"), "xcodec_tps25_0215",
+        #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
         # (os.path.join(TEST_MODEL_PATH, "higgs_audio_dual_ffn_1b_20250513"), "xcodec_0507_exp_1", os.path.join(TEST_MODEL_PATH, "xcodec_tps50_0507_exp1")),
         # (os.path.join(TEST_MODEL_PATH, "higgs_audio_qwen_1_5b_20250616"), "xcodec_0516_exp_1",
         #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0516_exp_1")),
-        # ("bosonai/higgs-audio-v2-generation-3B-base", "bosonai/higgs-audio-v2-tokenizer", None)
+        ("bosonai/higgs-audio-v2-generation-3B-base",
+         "bosonai/higgs-audio-v2-tokenizer", None)
     ])
 def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
                              tokenizer_type, tokenizer_path):
@@ -285,14 +286,22 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
     assert wer < 0.1
 
 
-def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
+@pytest.mark.parametrize(
+    "model_path, audio_tokenizer_type, audio_tokenizer_path",
+    [
+        # (os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325"), "xcodec_tps25_0215",
+        #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
+        ("bosonai/higgs-audio-v2-generation-3B-base",
+         "bosonai/higgs-audio-v2-tokenizer", None)
+    ])
+def test_audio_tts_voice_clone(speech_samples, asr_pipeline, model_path,
+                               audio_tokenizer_type, audio_tokenizer_path):
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    audio_tokenizer_type = "xcodec_tps25_0215"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
     os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+    if audio_tokenizer_path is not None:
+        os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
 
     batch_size = 20
     ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
@@ -301,7 +310,6 @@ def test_audio_tts_voice_clone(speech_samples, asr_pipeline):
             speech_samples[i], ref_audio_paths[i % len(ref_audio_paths)])
         for i in range(batch_size)
     ]
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
     llm = LLM(model=model_path, max_model_len=1024)
     sampling_params = SamplingParams(
         temperature=0.7,

@@ -112,7 +112,7 @@ MODEL_INFO = {
     },
     "higgs_audio_tokenizer": {
         "tps": 25,  # Will be updated based on the model config
-        "sampling_rate": 16000,  # Will be updated based on the model config
+        "sampling_rate": 24000,  # Will be updated based on the model config
         "num_codebooks": 8,  # Will be updated based on the model config
         "codebook_size": 1024,  # Will be updated based on the model config
     }
