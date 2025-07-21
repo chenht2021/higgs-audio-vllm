@@ -1753,20 +1753,17 @@ class AudioSpeechRequest(OpenAIBaseModel):
     speed: float = 1.0
     """ The speed of the audio speech request. """
 
-    temperature: float = 0.7
+    temperature: float = 1.0
     """ The temperature of the audio speech request. """
 
     top_p: float = 0.95
     """ The top p of the audio speech request. """
 
+    top_k: int = 50
+    """ The top k of the audio speech request. """
+
     response_format: Literal["wav", "mp3", "pcm"] = "pcm"
     """ The response format of the audio speech request. """
-
-    audio_chunk_size: Optional[int] = None
-    """ The size of the audio chunk """
-
-    audio_chunk_overlap_size: Optional[int] = None
-    """ The overlap size of the audio chunk """
 
     stop: Optional[list[str]] = None
 
@@ -1782,6 +1779,7 @@ class AudioSpeechRequest(OpenAIBaseModel):
         return SamplingParams.from_optional(
             temperature=self.temperature,
             top_p=self.top_p,
+            top_k=self.top_k,
             stop=['<|eot_id|>', '<|end_of_text|>', '<|audio_eos|>'],
             max_tokens=self.max_tokens,
             output_kind=RequestOutputKind.DELTA)

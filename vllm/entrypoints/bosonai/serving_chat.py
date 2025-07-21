@@ -138,8 +138,6 @@ class HiggsAudioServingChat(OpenAIServing):
         self.audio_tokenizer_tps = self.audio_tokenizer.tps
         self.samples_per_token = int(self.audio_tokenizer.sampling_rate //
                                      self.audio_tokenizer_tps)
-        self.hamming_window_len = \
-            2 * self.samples_per_token
 
     # ruff: noqa: E501  # Disable specific lint rules
     def get_chat_template(self) -> str:

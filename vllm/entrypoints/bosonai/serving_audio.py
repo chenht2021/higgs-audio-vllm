@@ -132,8 +132,8 @@ class HiggsAudioServingAudio(OpenAIServing):
         self.audio_tokenizer_tps = self.audio_tokenizer.tps
         self.samples_per_token = int(self.audio_tokenizer.sampling_rate //
                                      self.audio_tokenizer_tps)
-        self.hamming_window_len = \
-            2 * self.samples_per_token
+        self.audio_stream_bos_id = model_config.hf_config.audio_stream_bos_id
+        self.audio_stream_eos_id = model_config.hf_config.audio_stream_eos_id
 
     # ruff: noqa: E501  # Disable specific lint rules
     def get_chat_template(self) -> str:
@@ -151,7 +151,7 @@ class HiggsAudioServingAudio(OpenAIServing):
             "{{ content }}"
             "{% endfor %}"
             "{% if add_generation_prompt %}"
-            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|><|AUDIO_OUT|>' }}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n<|audio_out_bos|>' }}"
             "{% endif %}")
 
     async def create_audio_speech_stream(
@@ -339,11 +339,12 @@ class HiggsAudioServingAudio(OpenAIServing):
                             audio_chunk_size,
                             fade_out_audio,
                             finalize=True,
-                            is_first_chunk=is_first_audio_chunk,
                             audio_tokenizer=self.audio_tokenizer,
                             audio_codebook_size=self.audio_codebook_size,
                             samples_per_token=self.samples_per_token,
                             audio_num_codebooks=self.audio_num_codebooks,
+                            audio_stream_bos_id=self.audio_stream_bos_id,
+                            audio_stream_eos_id=self.audio_stream_eos_id,
                             return_as_numpy_audio=True)
                         audio_tokens_cache = np.ndarray(
                             (0, self.audio_num_codebooks), dtype=np.int64)
@@ -369,11 +370,12 @@ class HiggsAudioServingAudio(OpenAIServing):
                             first_audio_chunk_size,
                             fade_out_audio,
                             finalize=False,
-                            is_first_chunk=True,
                             audio_tokenizer=self.audio_tokenizer,
                             audio_codebook_size=self.audio_codebook_size,
                             samples_per_token=self.samples_per_token,
                             audio_num_codebooks=self.audio_num_codebooks,
+                            audio_stream_bos_id=self.audio_stream_bos_id,
+                            audio_stream_eos_id=self.audio_stream_eos_id,
                             return_as_numpy_audio=True)
                         audio_tokens_cache = audio_tokens_cache[
                             first_audio_chunk_size:]
@@ -385,11 +387,12 @@ class HiggsAudioServingAudio(OpenAIServing):
                             audio_chunk_size,
                             fade_out_audio,
                             finalize=False,
-                            is_first_chunk=False,
                             audio_tokenizer=self.audio_tokenizer,
                             audio_codebook_size=self.audio_codebook_size,
                             samples_per_token=self.samples_per_token,
                             audio_num_codebooks=self.audio_num_codebooks,
+                            audio_stream_bos_id=self.audio_stream_bos_id,
+                            audio_stream_eos_id=self.audio_stream_eos_id,
                             return_as_numpy_audio=True)
                         audio_tokens_cache = audio_tokens_cache[
                             audio_chunk_size:]
@@ -424,7 +427,8 @@ class HiggsAudioServingAudio(OpenAIServing):
                 audio_codebook_size=self.audio_codebook_size,
                 samples_per_token=self.samples_per_token,
                 audio_num_codebooks=self.audio_num_codebooks,
-                is_first_chunk=is_first_audio_chunk,
+                audio_stream_bos_id=self.audio_stream_bos_id,
+                audio_stream_eos_id=self.audio_stream_eos_id,
                 finalize=True,
                 return_as_numpy_audio=True)
             if audio_chunk is not None:
