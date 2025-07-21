@@ -1,0 +1,44 @@
+{
+  "dialogues": [
+    {
+      "id": 1,
+      "text": "[SPEAKER0] Hey, how was your weekend?\n[SPEAKER1] It was great! I went hiking with some friends. How about you?\n[SPEAKER0] I mostly stayed home and caught up on some reading. Which trail did you hike?"
+    },
+    {
+      "id": 2,
+      "text": "[SPEAKER0] Do you know what time the meeting starts tomorrow?\n[SPEAKER1] I think it's at 2 PM, but let me double-check the calendar.\n[SPEAKER0] Thanks, I want to make sure I don't schedule anything else during that time."
+    },
+    {
+      "id": 3,
+      "text": "[SPEAKER0] I'm having trouble with this code. The function keeps returning None.\n[SPEAKER1] Have you checked if you're passing the right parameters?\n[SPEAKER0] Good point, let me verify the input types first."
+    },
+    {
+      "id": 4,
+      "text": "[SPEAKER0] What should we have for dinner tonight?\n[SPEAKER1] How about we try that new Italian restaurant downtown?\n[SPEAKER0] Sounds perfect! Should I make a reservation?"
+    },
+    {
+      "id": 5,
+      "text": "[SPEAKER0] The weather forecast says it might rain tomorrow.\n[SPEAKER1] Oh no, I was planning to have a picnic in the park.\n[SPEAKER0] Maybe we could move it to the community center instead?"
+    },
+    {
+      "id": 6,
+      "text": "[SPEAKER0] Did you finish reading that book I recommended?\n[SPEAKER1] Yes, I loved it! The plot twist at the end was incredible.\n[SPEAKER0] I know, right? I didn't see it coming at all."
+    },
+    {
+      "id": 7,
+      "text": "[SPEAKER0] My car won't start this morning.\n[SPEAKER1] That's frustrating. Do you need a ride to work?\n[SPEAKER0] That would be amazing, thank you so much!"
+    },
+    {
+      "id": 8,
+      "text": "[SPEAKER0] I'm thinking about learning a new language.\n[SPEAKER1] That's exciting! Which language are you considering?\n[SPEAKER0] Maybe Spanish or French. I can't decide which would be more useful."
+    },
+    {
+      "id": 9,
+      "text": "[SPEAKER0] The coffee machine in the office is broken again.\n[SPEAKER1] Seriously? That's the third time this month.\n[SPEAKER0] I'll send an email to facilities management about getting it fixed."
+    },
+    {
+      "id": 10,
+      "text": "[SPEAKER0] Are you going to Sarah's birthday party on Saturday?\n[SPEAKER1] I wasn't planning to, but I should probably show up.\n[SPEAKER0] I think she'd really appreciate it if you came."
+    }
+  ]
+}

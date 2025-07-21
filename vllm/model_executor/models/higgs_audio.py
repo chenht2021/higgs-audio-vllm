@@ -541,10 +541,6 @@ def get_processor(
             "HIGGS_AUDIO_TOKENIZER_PATH",
             None,
         )
-        assert HIGGS_AUDIO_TOKENIZER_PATH is not None, (
-            "HIGGS_AUDIO_TOKENIZER_PATH is not set. Please set the "
-            "environment variable HIGGS_AUDIO_TOKENIZER_PATH to the path "
-            "of the tokenizer checkpoint to use.")
         feature_extractor = AudioTokenizer(
             model=HIGGS_AUDIO_TOKENIZER,
             device="cuda",

@@ -177,7 +177,8 @@ async def build_async_engine_client(
     engine_args = AsyncEngineArgs.from_cli_args(args)
 
     os.environ["HIGGS_AUDIO_TOKENIZER"] = args.audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = args.audio_tokenizer_path
+    if args.audio_tokenizer_path is not None:
+        os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = args.audio_tokenizer_path
     audio_tokenizer = AudioTokenizer(
         args.audio_tokenizer_type,
         downloaded_model_path=args.audio_tokenizer_path)

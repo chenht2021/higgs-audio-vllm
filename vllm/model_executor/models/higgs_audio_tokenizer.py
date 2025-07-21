@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa
 """Wrapper for audio tokenization."""
+import json
 import os
 import tempfile
 import warnings
@@ -14,6 +15,7 @@ import numpy as np
 import s3fs
 import torch
 import torch.nn.functional as F
+from huggingface_hub import snapshot_download
 from transformers import AutoFeatureExtractor, AutoModel, AutoProcessor
 
 MODEL_INFO = {
@@ -35,14 +37,12 @@ MODEL_INFO = {
     },
     # For xcodec, we save the config file to "base_folder/config.yaml" and the model file to "base_folder/model.pth"
     "xcodec_tps50": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps50/original",
         "tps": 50,
         "sampling_rate": 16000,
         "num_codebooks": 8,
         "codebook_size": 1024,
     },
     "xcodec_tps25_0215": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps25/0215_exp1_step630k",
         "tps": 25,
         "sampling_rate": 16000,
         "num_codebooks": 8,
@@ -50,7 +50,6 @@ MODEL_INFO = {
     },
     # First tokenizer with 24kHz sampling rate.
     "xcodec_0418_exp_2": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps25_24k/0418_exp_2",
         "tps": 25,
         "sampling_rate": 24000,
         "num_codebooks": 8,
@@ -58,7 +57,6 @@ MODEL_INFO = {
     },
     # Increase TPS to 50.
     "xcodec_0507_exp_1": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps50_24k/0507_exp_1",
         "tps": 50,
         "sampling_rate": 24000,
         "num_codebooks": 8,
@@ -66,7 +64,6 @@ MODEL_INFO = {
     },
     # Applying downprojection during codebook lookup, best 50TPS so far (25/05/28).
     "xcodec_0513_exp_3": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps50_24k/0513_exp_3",
         "tps": 50,
         "sampling_rate": 24000,
         "num_codebooks": 8,
@@ -74,7 +71,6 @@ MODEL_INFO = {
     },
     # Applying downprojection during codebook lookup for 25TPS.
     "xcodec_0516_exp_1": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps25_24k/0516_exp_1",
         "tps": 25,
         "sampling_rate": 24000,
         "num_codebooks": 8,
@@ -82,7 +78,6 @@ MODEL_INFO = {
     },
     # Reducing number of codebooks to 4.
     "xcodec_0521_exp_6": {
-        "path": "s3://data/audio_tokenizer/xcodec_tps50_24k/0521_exp_6",
         "tps": 25,
         "sampling_rate": 24000,
         "num_codebooks": 4,
@@ -90,8 +85,6 @@ MODEL_INFO = {
     },
     # Using whisper as semantic teacher.
     "xcodec_0501_exp_3_whisper": {
-        "path":
-        "s3://data/audio_tokenizer/xcodec_tps25_24k/0501_exp_3_whisper",
         "tps": 25,
         "sampling_rate": 24000,
         "num_codebooks": 8,
@@ -99,28 +92,29 @@ MODEL_INFO = {
     },
     # For xcodec2, we save the pt file directly
     "xcodec2_tps50": {
-        "path":
-        "s3://data/audio_tokenizer/xcodec2_tps50/original/epoch=4-step=1400000_weights.pt",
         "tps": 50,
         "sampling_rate": 16000,
         "num_codebooks": 1,
         "codebook_size": 65536,  # 4**8
     },
     "xcodec2_tps50_0223": {
-        "path":
-        "s3://data/audio_tokenizer/xcodec2_tps50/0223/epoch=1-step=240000_weights.pt",
         "tps": 50,
         "sampling_rate": 16000,
         "num_codebooks": 1,
         "codebook_size": 65536,  # 4**8
     },
     "cosyvoice2": {
-        "path": "s3://data/audio_tokenizer/cosyvoice2",
         "tps": 25,
         "sampling_rate":
         16000,  # CosyVoice2's input uses 16000 sampling rate but the flow + hifigan model uses 24000
         "num_codebooks": 1,
         "codebook_size": 6561,
+    },
+    "higgs_audio_tokenizer": {
+        "tps": 25,  # Will be updated based on the model config
+        "sampling_rate": 16000,  # Will be updated based on the model config
+        "num_codebooks": 8,  # Will be updated based on the model config
+        "codebook_size": 1024,  # Will be updated based on the model config
     }
 }
 
@@ -167,6 +161,7 @@ class AudioTokenizerType(Enum):
     XCODEC = "xcodec"
     XCODEC2 = "xcodec2"
     COSYVOICE2 = "cosyvoice2"
+    HIGGS_AUDIO_TOKENIZER = "higgs_audio_tokenizer"
 
 
 # Brought from https://github.com/openai/whisper/blob/517a43ecd132a2089d85f4ebc044728a71d49f6e/whisper/audio.py#L91-L92
@@ -267,8 +262,9 @@ class AudioTokenizer:
         self._model = model
         self._device = device
 
-        model_path = downloaded_model_path or MODEL_INFO[model]["path"]
-        self._tps = MODEL_INFO[model]["tps"]
+        model_path = downloaded_model_path
+        if model in MODEL_INFO:
+            self._tps = MODEL_INFO[model]["tps"]
         if model == "mimi" or model.startswith("dac"):
             self.audio_tokenizer_model = AutoModel.from_pretrained(
                 model_path, trust_remote_code=True)
@@ -412,6 +408,22 @@ class AudioTokenizer:
                     ])
                 self.audio_tokenizer_feature_extractor = None
 
+        elif "higgs-audio-v2-tokenizer" in model or "bosonai/" in model:
+            from xcodec.xcodec_wrapper import (XCodecFeatureExtractor,
+                                               load_codec_model)
+
+            self.model_type = AudioTokenizerType.HIGGS_AUDIO_TOKENIZER
+            model_path = snapshot_download(model)
+            self.audio_tokenizer_model = load_higgs_audio_tokenizer(
+                model_path,
+                device=device,
+            )
+            self._tps = self.audio_tokenizer_model.frame_rate
+            self._sampling_rate = self.audio_tokenizer_model.sample_rate
+            self._num_codebooks = self.audio_tokenizer_model.n_q
+            self._codebook_size = self.audio_tokenizer_model.quantizer_dim
+            self.audio_tokenizer_feature_extractor = XCodecFeatureExtractor(
+                sampling_rate=self._sampling_rate)
         else:
             raise ValueError(f"Unsupported audio tokenizer {model}")
 
@@ -492,7 +504,8 @@ class AudioTokenizer:
         with torch.no_grad():
             if self.model_type in [
                     AudioTokenizerType.DAC, AudioTokenizerType.MIMI,
-                    AudioTokenizerType.XCODEC
+                    AudioTokenizerType.XCODEC,
+                    AudioTokenizerType.HIGGS_AUDIO_TOKENIZER
             ]:
                 encoder_outputs = self.audio_tokenizer_model.encode(
                     input_values)
@@ -553,7 +566,7 @@ class AudioTokenizer:
                 decoded_wv = \
                     xcodec_decode_chunk_by_chunk(
                         self.audio_tokenizer_model, vq_code.unsqueeze(0),
-                        chunk_size=1500)[0, 0]
+                        chunk_size=60 * self.tps)[0, 0]
             elif self.model_type == AudioTokenizerType.XCODEC2:
                 decoded_wv = self.audio_tokenizer_model.decode_code(
                     vq_code.unsqueeze(0))[0, 0]
@@ -612,6 +625,12 @@ class AudioTokenizer:
                         finalize=True)
                     decoded_wv, _ = self._hift.inference(speech_feat=tts_mel)
                     decoded_wv = decoded_wv[0]
+
+            elif self.model_type == AudioTokenizerType.HIGGS_AUDIO_TOKENIZER:
+                decoded_wv = \
+                    xcodec_decode_chunk_by_chunk(
+                        self.audio_tokenizer_model, vq_code.unsqueeze(0),
+                        chunk_size=60 * self.tps)[0, 0]
             else:
                 raise NotImplementedError(
                     f"Audio tokenizer {self.model_type} not implemented")
@@ -626,6 +645,24 @@ class AudioTokenizer:
             else:
                 sampling_rate = self.sampling_rate
             return decoded_wv, sampling_rate
+
+
+def load_higgs_audio_tokenizer(tokenizer_name_or_path, device="cuda"):
+    from xcodec.models.soundstream_semantic import SoundStream
+    is_local = os.path.exists(tokenizer_name_or_path)
+    if not is_local:
+        tokenizer_path = snapshot_download(tokenizer_name_or_path)
+    else:
+        tokenizer_path = tokenizer_name_or_path
+    config_path = os.path.join(tokenizer_path, "config.json")
+    model_path = os.path.join(tokenizer_path, "model.pth")
+    config = json.load(open(config_path))
+    model = SoundStream(**config, )
+    parameter_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(parameter_dict, strict=False)
+    model.to(device)
+    model.eval()
+    return model
 
 
 def xcodec_get_output_length(input_length: int):

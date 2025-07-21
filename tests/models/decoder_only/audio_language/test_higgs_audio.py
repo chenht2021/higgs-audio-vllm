@@ -232,10 +232,13 @@ def remove_newlines(s: str) -> str:
 @pytest.mark.parametrize(
     "model_name, tokenizer_type, tokenizer_path",
     [
-        # ("higgs_audio_tts_1b_20250325", "xcodec_tps25_0215", os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
-        # ("higgs_audio_dual_ffn_1b_20250513", "xcodec_0507_exp_1", os.path.join(TEST_MODEL_PATH, "xcodec_tps50_0507_exp1")),
-        ("higgs_audio_qwen_1_5b_20250616", "xcodec_0516_exp_1",
-         os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0516_exp_1")),
+        (os.path.join(TEST_MODEL_PATH,
+                      "higgs_audio_tts_1b_20250325"), "xcodec_tps25_0215",
+         os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
+        # (os.path.join(TEST_MODEL_PATH, "higgs_audio_dual_ffn_1b_20250513"), "xcodec_0507_exp_1", os.path.join(TEST_MODEL_PATH, "xcodec_tps50_0507_exp1")),
+        # (os.path.join(TEST_MODEL_PATH, "higgs_audio_qwen_1_5b_20250616"), "xcodec_0516_exp_1",
+        #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0516_exp_1")),
+        # ("bosonai/higgs-audio-v2-generation-3B-base", "bosonai/higgs-audio-v2-tokenizer", None)
     ])
 def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
                              tokenizer_type, tokenizer_path):
@@ -247,8 +250,7 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
         prepare_zero_shot_conversation(speech_samples[i])
         for i in range(batch_size)
     ]
-    model_path = os.path.join(TEST_MODEL_PATH, model_name)
-    llm = LLM(model=model_path, max_model_len=1024, gpu_memory_utilization=0.6)
+    llm = LLM(model=model_name, max_model_len=1024, gpu_memory_utilization=0.6)
     sampling_params = SamplingParams(
         temperature=1.0,
         top_k=50,
