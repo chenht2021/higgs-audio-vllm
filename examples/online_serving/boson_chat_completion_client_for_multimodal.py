@@ -365,6 +365,10 @@ if __name__ == "__main__":
                             "tts", "audio_generation", "text_only", "dialogue",
                             "interleave"
                         ])
+    parser.add_argument("--model",
+                        type=str,
+                        default=None,
+                        help="Model to use.")
     args = parser.parse_args()
 
     client = OpenAI(
@@ -372,7 +376,10 @@ if __name__ == "__main__":
         base_url=args.api_base,
     )
 
-    models = client.models.list()
-    model = models.data[0].id
+    if args.model is None:
+        models = client.models.list()
+        model = models.data[0].id
+    else:
+        model = args.model
 
     main(args)

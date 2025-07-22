@@ -22,7 +22,7 @@ import uvloop
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import State
 from starlette.routing import Mount
@@ -507,6 +507,14 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     finally:
         sock.close()
 
+def engine_client(request: Request) -> EngineClient:
+    return request.app.state.engine_client
+
+@router.get("/health")
+async def health(raw_request: Request) -> Response:
+    """Health check."""
+    await engine_client(raw_request).check_health()
+    return Response(status_code=200)
 
 @router.get("/v1/models")
 async def show_available_models(raw_request: Request):
