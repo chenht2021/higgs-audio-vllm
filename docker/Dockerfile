@@ -105,6 +105,15 @@ ENV MAX_JOBS=${max_jobs}
 ARG nvcc_threads=64
 ENV NVCC_THREADS=$nvcc_threads
 
+ARG VLLM_USE_PRECOMPILED
+ARG VLLM_PRECOMPILED_WHEEL_LOCATION
+# Create a dummy file for when no precompiled wheel is used
+RUN touch dummy_wheel.whl
+# Copy precompiled wheel or dummy file based on argument
+COPY ${VLLM_PRECOMPILED_WHEEL_LOCATION:-dummy_wheel.whl} vllm-precompiled.whl
+# Set environment variable only if using precompiled wheel
+ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_USE_PRECOMPILED:+vllm-precompiled.whl}
+
 ARG USE_SCCACHE
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
@@ -137,6 +146,11 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         rm -rf .deps && \
         mkdir -p .deps && \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
+        if [ "$VLLM_USE_PRECOMPILED" = "1" ]; then \
+            # Need to run setup twice to get the library file copied to the wheel.
+            python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
+            rm $VLLM_PRECOMPILED_WHEEL_LOCATION; \
+        fi; \
     fi
 
 # Check the size of the wheel if RUN_WHEEL_CHECK is true

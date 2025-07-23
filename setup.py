@@ -663,6 +663,47 @@ package_data = {
     ]
 }
 
+# Pre-populate package_data with precompiled binaries if using precompiled mode
+if envs.VLLM_USE_PRECOMPILED:
+    wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
+    if wheel_location is None:
+        # Use the same logic as repackage_wheel to find the wheel
+        try:
+            resp_json = subprocess.check_output([
+                "curl", "-s",
+                "https://api.github.com/repos/vllm-project/vllm/commits/main"
+            ]).decode("utf-8")
+            upstream_main_commit = json.loads(resp_json)["sha"]
+            base_commit = subprocess.check_output(
+                ["git", "merge-base", f"{upstream_main_commit}",
+                 "HEAD"]).decode("utf-8").strip()
+            wheel_location = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+            if not is_url_available(wheel_location):
+                wheel_location = "https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+        except Exception:
+            wheel_location = "https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+
+    if wheel_location and (os.path.isfile(wheel_location)
+                           or is_url_available(wheel_location)):
+        files_to_copy = [
+            "vllm/_C.abi3.so",
+            "vllm/_moe_C.abi3.so",
+            "vllm/_flashmla_C.abi3.so",
+            "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+            "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
+            "vllm/cumem_allocator.abi3.so",
+        ]
+
+        for file_path in files_to_copy:
+            package_name = os.path.dirname(file_path).replace("/", ".")
+            file_name = os.path.basename(file_path)
+
+            if package_name not in package_data:
+                package_data[package_name] = []
+            package_data[package_name].append(file_name)
+
+    print(f"package_data: {package_data}")
+
 if _no_device():
     ext_modules = []
 
