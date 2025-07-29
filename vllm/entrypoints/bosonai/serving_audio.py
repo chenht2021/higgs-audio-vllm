@@ -285,10 +285,10 @@ class HiggsAudioServingAudio(OpenAIServing):
     def tts_voice_raw(self, voice: str, voice_presets_dir: str,
                       voice_presets: dict):
         if voice not in voice_presets:
-            logger.warning(
-                "Unsupported voice: %s, using default voice: en_woman_1",
-                voice)
-            voice = list(voice_presets.keys())[0]
+            default_voice = list(voice_presets.keys())[0]
+            logger.warning("Unsupported voice: %s, using default voice: %s",
+                           voice, default_voice)
+            voice = default_voice
         path = os.path.join(voice_presets_dir,
                             voice_presets[voice]["audio_file"])
         audio_base64 = encode_base64_content_from_file(path)
