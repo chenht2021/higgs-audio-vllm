@@ -544,7 +544,6 @@ def get_processor(
         feature_extractor = AudioTokenizer(
             model=HIGGS_AUDIO_TOKENIZER,
             device="cuda",
-            downloaded_model_path=HIGGS_AUDIO_TOKENIZER_PATH,
         )
     processor = HFHiggsAudioProcessor(
         feature_extractor=feature_extractor,

@@ -180,8 +180,8 @@ class ChatCompletionAudioParam(BaseModel):
     format: Literal["wav", "mp3", "flac", "opus", "pcm16"] = "wav"
     voice: Literal["alloy", "ash", "ballad", "coral", "echo", "sage",
                    "shimmer", "verse"] = "alloy"
-    chunk_size: Optional[int] = None
-    chunk_overlap_size: Optional[int] = None
+    audio_chunk_size: Optional[int] = None
+    audio_chunk_overlap_size: Optional[int] = None
 
 
 ChatCompletionModality = Literal["text", "audio"]

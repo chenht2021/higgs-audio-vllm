@@ -339,9 +339,9 @@ COPY requirements/bosonai.txt requirements/bosonai.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements/bosonai.txt
 
-COPY third_party/xcodec xcodec
+COPY external/higgs-audio higgs-audio
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -e xcodec --no-deps
+    uv pip install --system -e higgs-audio --no-deps
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.bosonai.api_server"]
 #################### BOSONAI API SERVER ####################

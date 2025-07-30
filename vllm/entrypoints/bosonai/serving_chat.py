@@ -194,10 +194,11 @@ class HiggsAudioServingChat(OpenAIServing):
 
         audio_chunk_size = self.audio_tokenizer_tps
         audio_chunk_overlap_size = self.audio_tokenizer_tps
-        if request.audio is not None and hasattr(request.audio, 'chunk_size'):
-            audio_chunk_size = request.audio.chunk_size or audio_chunk_size
+        if request.audio is not None and hasattr(request.audio,
+                                                 "audio_chunk_size"):
+            audio_chunk_size = request.audio.audio_chunk_size or audio_chunk_size
             audio_chunk_overlap_size = \
-                request.audio.chunk_overlap_size or audio_chunk_overlap_size
+                request.audio.audio_chunk_overlap_size or audio_chunk_overlap_size
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
             tool_choice_function_name = request.tool_choice.function.name

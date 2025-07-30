@@ -136,6 +136,9 @@ def run_tts(stream: bool = False) -> None:
         modalities=["text", "audio"],
         temperature=1.0,
         top_p=0.95,
+        extra_body={
+            "top_k": 50,
+        },
         stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
     )
     if stream:
@@ -227,7 +230,11 @@ def run_generate_dialogue(stream: bool = False) -> None:
         stream_options={"include_usage": True},
         stop=["<|end_of_text|>", "<|eot_id|>", "<|audio_eos|>"],
         modalities=["text", "audio"],
-        temperature=0.7,
+        temperature=1.0,
+        top_p=0.95,
+        extra_body={
+            "top_k": 50,
+        },
         # extra_body={
         #     "ras_win_len": 7,
         #     "ras_win_max_num_repeat": 2,
@@ -293,6 +300,9 @@ def run_interleave_audio_generation(stream: bool = False) -> None:
         modalities=["text", "audio"],
         temperature=1.0,
         top_p=0.95,
+        extra_body={
+            "top_k": 50,
+        },
         stop=["<|eot_id|>", "<|end_of_text|>"],
     )
 

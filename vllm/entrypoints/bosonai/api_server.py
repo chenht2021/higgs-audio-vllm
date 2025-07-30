@@ -180,8 +180,9 @@ async def build_async_engine_client(
     if args.audio_tokenizer_path is not None:
         os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = args.audio_tokenizer_path
     audio_tokenizer = AudioTokenizer(
-        args.audio_tokenizer_type,
-        downloaded_model_path=args.audio_tokenizer_path)
+        model=args.audio_tokenizer_path or args.audio_tokenizer_type,
+        device="cuda",
+    )
 
     # HACK: This is a hack to allow more than one audio per request.
     if not hasattr(engine_args, "limit_mm_per_prompt") or \

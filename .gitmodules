@@ -1,4 +1,4 @@
 
-[submodule "third_party/xcodec"]
-	path = third_party/xcodec
-	url = https://github.com/boson-ai/xcodec.git
+[submodule "external/higgs-audio"]
+	path = external/higgs-audio
+	url = https://github.com/boson-ai/higgs-audio.git

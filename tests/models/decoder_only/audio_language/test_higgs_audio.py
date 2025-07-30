@@ -20,7 +20,6 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from vllm import LLM, SamplingParams
 from vllm.entrypoints.bosonai.serving_audio import HiggsAudioServingAudio
 from vllm.entrypoints.bosonai.serving_chat import HiggsAudioServingChat
-from vllm.entrypoints.bosonai.utils import split_interleaved_delayed_audios
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (AudioSpeechRequest,
                                               ChatCompletionRequest)
@@ -64,48 +63,7 @@ AUDIO_OUT_CHAT_TEMPLATE = (
     "{% endif %}")
 # fmt: on
 
-TEST_MODEL_PATH = "/fsx/models/higgs_audio_test_models"
-
 OPENAI_TTS_SAMPLE_RATE = 24000
-
-
-def test_tts_chat_template():
-    from transformers import AutoTokenizer
-
-    chat_template = AUDIO_OUT_CHAT_TEMPLATE
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    conversation = [{
-        "role": "user",
-        "content": "Hello1"
-    }, {
-        "role": "assistant",
-        "content": "<|audio_bos|><|AUDIO|>"
-    }, {
-        "role": "user",
-        "content": "Hello2"
-    }]
-
-    result = tokenizer.apply_chat_template(
-        chat_template=chat_template,
-        conversation=conversation,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    ref = textwrap.dedent("""
-        <|begin_of_text|><|start_header_id|>user<|end_header_id|>
-
-        Hello1<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-        <|audio_out_bos|><|AUDIO|><|eot_id|><|start_header_id|>user<|end_header_id|>
-
-        Hello2<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-        <|audio_out_bos|><|AUDIO_OUT|>
-    """).lstrip('\n').rstrip('\n')
-    assert result == ref
 
 
 @pytest.fixture(scope="module")
@@ -229,24 +187,15 @@ def remove_newlines(s: str) -> str:
     return s.replace("\n", " ")
 
 
-@pytest.mark.parametrize(
-    "model_name, tokenizer_type, tokenizer_path",
-    [
-        # (os.path.join(TEST_MODEL_PATH,
-        #               "higgs_audio_tts_1b_20250325"), "xcodec_tps25_0215",
-        #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
-        # (os.path.join(TEST_MODEL_PATH, "higgs_audio_dual_ffn_1b_20250513"), "xcodec_0507_exp_1", os.path.join(TEST_MODEL_PATH, "xcodec_tps50_0507_exp1")),
-        # (os.path.join(TEST_MODEL_PATH, "higgs_audio_qwen_1_5b_20250616"), "xcodec_0516_exp_1",
-        #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0516_exp_1")),
-        ("bosonai/higgs-audio-v2-generation-3B-base",
-         "bosonai/higgs-audio-v2-tokenizer", None)
-    ])
+@pytest.mark.parametrize("model_name, tokenizer",
+                         [("bosonai/higgs-audio-v2-generation-3B-base",
+                           "bosonai/higgs-audio-v2-tokenizer")])
 def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
-                             tokenizer_type, tokenizer_path):
+                             tokenizer):
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    batch_size = 1
+    batch_size = 20
     conversations = [
         prepare_zero_shot_conversation(speech_samples[i])
         for i in range(batch_size)
@@ -266,8 +215,7 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
         chat_template=AUDIO_OUT_CHAT_TEMPLATE,
     )
 
-    audio_tokenizer = AudioTokenizer(tokenizer_type,
-                                     downloaded_model_path=tokenizer_path)
+    audio_tokenizer = AudioTokenizer(model=tokenizer)
 
     reference = ""
     hypothesis = ""
@@ -286,22 +234,16 @@ def test_audio_tts_zero_shot(speech_samples, asr_pipeline, model_name,
     assert wer < 0.1
 
 
-@pytest.mark.parametrize(
-    "model_path, audio_tokenizer_type, audio_tokenizer_path",
-    [
-        # (os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325"), "xcodec_tps25_0215",
-        #  os.path.join(TEST_MODEL_PATH, "xcodec_tps25_0215")),
-        ("bosonai/higgs-audio-v2-generation-3B-base",
-         "bosonai/higgs-audio-v2-tokenizer", None)
-    ])
+@pytest.mark.parametrize("model_path, audio_tokenizer",
+                         [("bosonai/higgs-audio-v2-generation-3B-base",
+                           "bosonai/higgs-audio-v2-tokenizer")])
 def test_audio_tts_voice_clone(speech_samples, asr_pipeline, model_path,
-                               audio_tokenizer_type, audio_tokenizer_path):
+                               audio_tokenizer):
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    if audio_tokenizer_path is not None:
-        os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer
+    audio_tokenizer = AudioTokenizer(model=audio_tokenizer)
 
     batch_size = 20
     ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
@@ -322,9 +264,6 @@ def test_audio_tts_voice_clone(speech_samples, asr_pipeline, model_path,
         use_tqdm=False,
         chat_template=AUDIO_OUT_CHAT_TEMPLATE,
     )
-
-    audio_tokenizer = AudioTokenizer(
-        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
 
     reference = ""
     hypothesis = ""
@@ -389,133 +328,19 @@ def dialogue_sample_1():
     return dialogue_sample
 
 
-def test_audio_tts_dialogue(speech_samples, dialogue_sample_1, asr_pipeline):
-    audio_tokenizer_type = "xcodec_tps25_0215"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
-    llm = LLM(model=model_path,
-              max_model_len=1024,
-              limit_mm_per_prompt={"audio": 50})
-    sampling_params = SamplingParams(
-        temperature=0.7,
-        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
-        max_tokens=512)
-
-    batch_size = 20
-    conversations = []
-    # Mix the dialogue sample with the voice clone sample
-    for i in range(batch_size):
-        if i % 2 == 0:
-            conversations.append(dialogue_sample_1)
-        else:
-            conversations.append(
-                prepare_tts_voice_clone_sample(speech_samples[i % 20],
-                                               "en_woman_1.wav"))
-
-    outputs = llm.chat(
-        conversations,
-        sampling_params=sampling_params,
-        use_tqdm=False,
-        chat_template=AUDIO_OUT_CHAT_TEMPLATE,
-    )
-
-    audio_tokenizer = AudioTokenizer(
-        "xcodec_tps25_0215",
-        downloaded_model_path=
-        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
-
-    reference = ""
-    hypothesis = ""
-    for i in range(len(outputs)):
-        audio_out_ids = \
-            np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
-        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
-        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
-        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        #sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
-        if i % 2 == 0:
-            reference += clean_punctuation(
-                remove_newlines(
-                    clean_speaker_tag(
-                        dialogue_sample_1[-1]["content"][0]))).lower()
-        else:
-            reference += clean_punctuation(speech_samples[i % 20]).lower()
-        hypothesis += clean_punctuation(asr_text).lower()
-
-    wer = jiwer.wer(reference, hypothesis)
-    print(f"WER: {wer}")
-    print(f"Reference: {reference}")
-    print(f"Hypothesis: {hypothesis}")
-    assert wer < 0.05
-
-
-def test_audio_in_text_out():
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = "openai/whisper-large-v3-turbo"
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_in_3b_20241222")
-    llm = LLM(model=model_path, max_model_len=1024)
-    audio_path = "./audiobook_sample.mp3"
-    audio_base64 = encode_base64_content_from_file(audio_path)
-    file_suffix = audio_path.split(".")[-1]
-    conversation = [
-        {
-            "role": "system",
-            "content": "Transcribe the audio.",
-        },
-        {
-            "role":
-            "user",
-            "content": [
-                {
-                    "type": "audio_url",
-                    "audio_url": {
-                        # Any format supported by librosa is supported
-                        "url":
-                        f"data:audio/{file_suffix};base64,{audio_base64}"
-                    },
-                },
-            ],
-        },
-    ]
-    sampling_params = SamplingParams(
-        temperature=0,
-        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
-        max_tokens=512)
-    outputs = llm.chat(
-        conversation,
-        sampling_params=sampling_params,
-        use_tqdm=False,
-        chat_template=TEXT_OUT_CHAT_TEMPLATE,
-    )
-    reference_output = (
-        "The spookie just tells you how you're doing up. He is a great ex-plover. "
-        "No grass left, no cajun, there's lots of grass left, there'll be lots of "
-        "grass left and just a few some for the rabbits. What rabbit?")
-    assert outputs[0].outputs[0].text == reference_output
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "model_name, tokenizer_type, tokenizer_path",
-    [
-        # ("higgs_audio_tts_1b_20250325", "xcodec_tps25_0215", "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"),
-        ("higgs_audio_qwen_1_5b_20250616", "xcodec_0516_exp_1",
-         "/fsx/models/higgs_audio_test_models/xcodec_tps25_0516_exp_1/"),
-        # ("higgs_audio_dual_ffn_1b_20250513", "xcodec_0507_exp_1", "/fsx/models/higgs_audio_test_models/xcodec_tps50_0507_exp1/"),
-    ])
+@pytest.mark.parametrize("model_name, tokenizer",
+                         [("bosonai/higgs-audio-v2-generation-3B-base",
+                           "bosonai/higgs-audio-v2-tokenizer")])
 async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline,
-                                           model_name, tokenizer_type,
-                                           tokenizer_path):
+                                           model_name, tokenizer):
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = tokenizer_path
-    model_path = os.path.join(TEST_MODEL_PATH, model_name)
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = tokenizer
+    model_path = model_name
 
-    audio_tokenizer = AudioTokenizer(tokenizer_type,
-                                     downloaded_model_path=tokenizer_path)
+    audio_tokenizer = AudioTokenizer(model=tokenizer)
 
     batch_size = 20
     ref_audio_paths = ["en_woman_1.wav", "en_man_1.wav"]
@@ -529,8 +354,7 @@ async def test_audio_tts_voice_clone_async(speech_samples, asr_pipeline,
                                   max_model_len=1024,
                                   limit_mm_per_prompt={
                                       "audio": 50
-                                  },
-                                  enforce_eager=True).create_engine_config(
+                                  }).create_engine_config(
                                       UsageContext.ENGINE_CONTEXT)
     engine = AsyncLLM.from_vllm_config(vllm_config)
     model_config = await engine.get_model_config()
@@ -597,16 +421,11 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    audio_tokenizer_type = "xcodec_tps25_0215"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-    model_path = "/fsx/models/releases/higgs-audio-generation-3b-v1.0-sft-20250331/"
+    model_path = "bosonai/higgs-audio-v2-generation-3B-base"
+    audio_tokenizer_path = "bosonai/higgs-audio-v2-tokenizer"
 
-    audio_tokenizer = AudioTokenizer(
-        "xcodec_tps25_0215",
-        downloaded_model_path=
-        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_path
+    audio_tokenizer = AudioTokenizer(model=audio_tokenizer_path, device="cuda")
 
     batch_size = 20
     conversations = [
@@ -618,8 +437,7 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
                                   max_model_len=1024,
                                   limit_mm_per_prompt={
                                       "audio": 50
-                                  },
-                                  enforce_eager=True).create_engine_config(
+                                  }).create_engine_config(
                                       UsageContext.ENGINE_CONTEXT)
     engine = AsyncLLM.from_vllm_config(vllm_config)
     model_config = await engine.get_model_config()
@@ -647,6 +465,7 @@ async def test_audio_tts_voice_clone_async_streaming(speech_samples,
             model="higgs_audio",
             max_completion_tokens=500,
             top_p=0.95,
+            top_k=50,
             temperature=1,
             stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
             stream=True,
@@ -710,25 +529,17 @@ async def test_audio_speech_api(speech_samples, asr_pipeline):
     torch.random.manual_seed(0)
     np.random.seed(0)
 
-    audio_tokenizer_type = "xcodec_tps25_0215"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/"
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-    # model_path = "/fsx/models/releases/higgs-audio-generation-3b-v1.0-sft-20250331/"
-    model_path = os.path.join(TEST_MODEL_PATH, "higgs_audio_tts_1b_20250325")
-
-    audio_tokenizer = AudioTokenizer(
-        "xcodec_tps25_0215",
-        downloaded_model_path=
-        "/fsx/models/higgs_audio_test_models/xcodec_tps25_0215/")
+    model_path = "bosonai/higgs-audio-v2-generation-3B-base"
+    audio_tokenizer_path = "bosonai/higgs-audio-v2-tokenizer"
+    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_path
+    audio_tokenizer = AudioTokenizer(model=audio_tokenizer_path, device="cuda")
 
     batch_size = 1
     vllm_config = AsyncEngineArgs(model=model_path,
                                   max_model_len=1024,
                                   limit_mm_per_prompt={
                                       "audio": 50
-                                  },
-                                  enforce_eager=True).create_engine_config(
+                                  }).create_engine_config(
                                       UsageContext.ENGINE_CONTEXT)
     engine = AsyncLLM.from_vllm_config(vllm_config)
     model_config = await engine.get_model_config()
@@ -763,8 +574,6 @@ async def test_audio_speech_api(speech_samples, asr_pipeline):
             input=text,
             model="higgs_audio",
             response_format="pcm",
-            temperature=0.7,
-            top_p=0.95,
         )
         output = await serving_audio.create_audio_speech_stream(
             request=request_json,
@@ -801,327 +610,3 @@ async def test_audio_speech_api(speech_samples, asr_pipeline):
     wer = jiwer.wer(reference, hypothesis)
     print(f"WER: {wer}")
     assert wer < 0.05
-
-
-def prepare_text_audio_interleave_sample():
-    system_prompt = """Generate audio following instruction.
-<|scene_desc_start|>
-SPEAKER0: vocal fry;moderate pitch;monotone;masculine;young adult;slightly fast
-SPEAKER1: masculine;moderate;moderate pitch;monotone;mature
-In this scene, a group of adventurers is debating whether to investigate a potentially dangerous situation.
-<|scene_desc_end|>"""
-    return [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role":
-            "user",
-            "content":
-            "<|generation_instruction_start|>\nGenerate interleaved transcript and audio that lasts for around 10 seconds.\n<|generation_instruction_end|>",
-        },
-    ]
-
-
-@pytest.mark.parametrize("model_name", [
-    "higgs_audio_dual_ffn_1b_20250513",
-])
-def test_audio_text_audio_interleave(model_name):
-    torch.random.manual_seed(0)
-    np.random.seed(0)
-
-    audio_tokenizer_type = "xcodec_0507_exp_1"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps50_0507_exp1/"
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-
-    batch_size = 1
-    conversations = [
-        prepare_text_audio_interleave_sample() for _ in range(batch_size)
-    ]
-
-    model_path = os.path.join(TEST_MODEL_PATH, model_name)
-    llm = LLM(model=model_path, max_model_len=2048)
-    sampling_params = SamplingParams(temperature=1.0,
-                                     max_tokens=1024,
-                                     top_p=0.95,
-                                     top_k=50,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"])
-
-    outputs = llm.chat(
-        conversations,
-        sampling_params=sampling_params,
-        use_tqdm=False,
-        chat_template=TEXT_OUT_CHAT_TEMPLATE,
-    )
-    audio_tokenizer = AudioTokenizer(
-        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
-    audio_stream_eos_id = llm.llm_engine.model_config.hf_config.audio_stream_eos_id
-    for i in range(len(outputs)):
-        audio_datas = split_interleaved_delayed_audios(
-            outputs[i].outputs[0].mm_token_ids, audio_tokenizer,
-            audio_stream_eos_id)
-        decoded_audios = []
-        for audio_data in audio_datas:
-            audio_data = np.array(audio_data).transpose(1, 0).clip(
-                0, audio_tokenizer.codebook_size - 1)[:, 1:-1]
-            decoded_audio, sr = audio_tokenizer.decode(
-                revert_delay_pattern(audio_data))
-            decoded_audios.append(decoded_audio)
-        # asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        decoded_audio = np.concatenate(decoded_audios)
-        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
-        print(outputs[i].outputs[0].text)
-
-
-@pytest.mark.asyncio
-async def test_audio_interleaved_async_streaming():
-    torch.random.manual_seed(0)
-    np.random.seed(0)
-
-    audio_tokenizer_type = "xcodec_0507_exp_1"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps50_0507_exp1/"
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-    model_path = os.path.join(TEST_MODEL_PATH,
-                              "higgs_audio_dual_ffn_1b_20250513")
-
-    audio_tokenizer = AudioTokenizer(
-        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
-
-    batch_size = 1
-    conversations = [
-        prepare_text_audio_interleave_sample() for i in range(batch_size)
-    ]
-
-    vllm_config = AsyncEngineArgs(model=model_path,
-                                  max_model_len=2048,
-                                  limit_mm_per_prompt={
-                                      "audio": 50
-                                  },
-                                  enforce_eager=True).create_engine_config(
-                                      UsageContext.ENGINE_CONTEXT)
-    engine = AsyncLLM.from_vllm_config(vllm_config)
-    model_config = await engine.get_model_config()
-    base_model_paths = [
-        BaseModelPath(name="higgs_audio", model_path=model_path)
-    ]
-    openai_serving_models = OpenAIServingModels(
-        engine_client=engine,
-        model_config=model_config,
-        base_model_paths=base_model_paths,
-    )
-    serving_chat = HiggsAudioServingChat(
-        engine,
-        model_config,
-        openai_serving_models,
-        response_role="assistant",
-        request_logger=None,
-        chat_template_content_format="auto",
-        audio_tokenizer=audio_tokenizer,
-    )
-
-    async def process_request(conversation):
-        request_json = ChatCompletionRequest(
-            messages=conversation,
-            model="higgs_audio",
-            max_completion_tokens=1024,
-            top_p=0.95,
-            temperature=1.0,
-            stop=["<|eot_id|>", "<|end_of_text|>"],
-            stream=True,
-            modalities=["audio", "text"])
-        audio_bytes_io = io.BytesIO()
-        text = ""
-        i = 0
-        output = await serving_chat.create_chat_completion(request_json)
-        async for chunk_str in output:
-            # Parse the SSE format: "data: {json}\n\n"
-            if chunk_str.startswith("data: "):
-                json_str = chunk_str[6:]  # Remove "data: " prefix
-                if json_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(json_str)
-                    # print(f"Chunk {i}: {chunk}")
-                    if (chunk.get("choices", None) is not None
-                            and chunk["choices"][0].get("delta",
-                                                        None) is not None):
-                        if chunk["choices"][0]["delta"].get("content",
-                                                            None) is not None:
-                            text += chunk["choices"][0]["delta"]["content"]
-                        if chunk["choices"][0]["delta"].get("audio",
-                                                            None) is not None:
-                            audio_bytes = base64.b64decode(
-                                chunk["choices"][0]["delta"]["audio"]["data"])
-                            audio_bytes_io.write(audio_bytes)
-                            i += 1
-                except json.JSONDecodeError:
-                    # Skip malformed JSON
-                    continue
-            else:
-                print(chunk_str)
-        audio_bytes_io.seek(0)
-        audio_data = np.frombuffer(audio_bytes_io.getvalue(), dtype=np.int16)
-        return audio_data, text
-
-    # Create tasks for each conversation
-    tasks = []
-    for i in range(batch_size):
-        task = asyncio.create_task(process_request(conversations[i]))
-        tasks.append(task)
-
-        # Add a 10ms delay between requests
-        await asyncio.sleep(0.01)
-
-    outputs = await asyncio.gather(*tasks)
-    assert len(outputs) == batch_size
-    for i, output in enumerate(outputs):
-        audio_data, text = output
-        sf.write(f"audio_dumps/audio_out_{i}.wav", audio_data,
-                 audio_tokenizer.sampling_rate)
-        print(f"{i}th Text: {text}")
-
-
-def prepare_multispeaker_sample(dialogue: str):
-    system_text = f"""As an AI assistant, your task is to convert written text into spoken words.
-    If the user's input begins with a [SPEAKER*] tag, omit the tag and create speech based on the following content using the designated voice.
-    Without a speaker tag, choose the most suitable voice for the text.
-    """
-    # Define speakers
-    ref_audio_0 = encode_base64_content_from_file("en_woman_1.wav")
-    ref_text_0 = "The device would work during the day as well, if you took steps to either block direct sunlightor point it away from the sun."
-    ref_audio_1 = encode_base64_content_from_file("en_man_1.wav")
-    ref_text_1 = "Maintaining your ability to learn translates into increased marketability, improved career options and higher salaries."
-    conversation = [{
-        "role": "system",
-        "content": system_text
-    }, {
-        "role": "user",
-        "content": "[SPEAKER_0] " + ref_text_0
-    }, {
-        "role":
-        "assistant",
-        "content": [{
-            "type": "input_audio",
-            "input_audio": {
-                "data": ref_audio_0,
-            }
-        }]
-    }, {
-        "role": "user",
-        "content": "[SPEAKER_1] " + ref_text_1
-    }, {
-        "role":
-        "assistant",
-        "content": [{
-            "type": "input_audio",
-            "input_audio": {
-                "data": ref_audio_1,
-            }
-        }]
-    }, {
-        "role": "user",
-        "content": dialogue
-    }]
-    return conversation
-
-
-@pytest.fixture(scope="module")
-def dialogue_samples():
-    with open(os.path.join(os.path.dirname(__file__), "dialogue_samples.txt"),
-              "r") as f:
-        dialogue_json = json.load(f)
-    dialogues = [dialogue["text"] for dialogue in dialogue_json["dialogues"]]
-    return dialogues
-
-
-def remove_speaker_tag(text: str) -> str:
-    return re.sub(r"\[SPEAKER\d+\]", "", text)
-
-
-def test_audio_multispeaker_voice_clone(dialogue_samples, asr_pipeline):
-    torch.random.manual_seed(0)
-    np.random.seed(0)
-
-    audio_tokenizer_type = "xcodec_0516_exp_1"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0516_exp_1/"
-    os.environ["HIGGS_AUDIO_TOKENIZER"] = audio_tokenizer_type
-    os.environ["HIGGS_AUDIO_TOKENIZER_PATH"] = audio_tokenizer_path
-
-    batch_size = 1
-    conversations = [
-        prepare_multispeaker_sample(dialogue_samples[i %
-                                                     len(dialogue_samples)])
-        for i in range(batch_size)
-    ]
-    model_path = "/fsx/workspace/xingjian/boson-multimodal/scripts/results/checkpoint_340000_train_20250616_sft_v3_lr0.0001_ga1_bs1_de1_lm0_e0_t0_au1_1_c2_ea1_ew0_cl2_tw1.0_0.95_1e-08_cos_wd0.1_10000_flash_attention_2_1_s200000_sft/checkpoint_60000"
-    llm = LLM(model=model_path,
-              max_model_len=2048,
-              limit_mm_per_prompt={"audio": 50},
-              gpu_memory_utilization=0.8)
-    sampling_params = SamplingParams(temperature=1.0,
-                                     top_p=0.95,
-                                     top_k=50,
-                                     max_tokens=500,
-                                     stop=["<|eot_id|>", "<|end_of_text|>"])
-
-    outputs = llm.chat(
-        conversations,
-        sampling_params=sampling_params,
-        use_tqdm=False,
-        chat_template=AUDIO_OUT_CHAT_TEMPLATE,
-    )
-
-    audio_tokenizer = AudioTokenizer(
-        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
-
-    reference = ""
-    hypothesis = ""
-    for i in range(len(outputs)):
-        audio_out_ids = \
-            np.array(outputs[i].outputs[0].mm_token_ids).transpose(1, 0).clip(0, audio_tokenizer.codebook_size - 1)
-        reverted_audio_out_ids = revert_delay_pattern(audio_out_ids)
-        decoded_audio, sr = audio_tokenizer.decode(reverted_audio_out_ids)
-        asr_text = _get_asr(decoded_audio, sr, asr_pipeline)
-        # sf.write(f"audio_dumps/audio_out_{i}.wav", decoded_audio, sr)
-        reference_text = remove_speaker_tag(
-            dialogue_samples[i % len(dialogue_samples)])
-        reference_text = clean_punctuation(reference_text).lower()
-        reference += reference_text
-        hypothesis += clean_punctuation(asr_text).lower()
-
-    wer = jiwer.wer(reference, hypothesis)
-    print(f"WER: {wer}")
-    assert wer < 0.05
-
-
-def prepare_dialogue_generate_sample():
-    system_prompt = "Generate audio following instruction.\n\n<|scene_desc_start|>\nThis R&B track features a slow, sultry beat with a strong emphasis on emotional vocals. The instrumentation includes a deep bassline, soft piano chords, and atmospheric synthesizers, creating a melancholic and heartfelt atmosphere. The lyrics convey themes of love, heartbreak, and longing, making it a deeply emotional listening experience.\n<|scene_desc_end|>"
-    return [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role":
-            "user",
-            "content":
-            "<|generation_instruction_start|>\nGenerate interleaved transcript and audio that lasts for around 30 seconds.\n<|generation_instruction_end|>",
-        },
-    ]
-
-
-@pytest.mark.parametrize("input_length", [102, 1000])
-def test_xcodec_decode_chunk_by_chunk(input_length):
-    audio_tokenizer_type = "xcodec_0516_exp_1"
-    audio_tokenizer_path = "/fsx/models/higgs_audio_test_models/xcodec_tps25_0516_exp_1/"
-    audio_tokenizer = AudioTokenizer(
-        audio_tokenizer_type, downloaded_model_path=audio_tokenizer_path)
-    xcodec_model = audio_tokenizer.audio_tokenizer_model
-    codes = torch.randint(0, 1024, (1, 8, input_length)).to("cuda")
-    with torch.no_grad():
-        gold_output = xcodec_model.decode(codes)
-        output = xcodec_model.decode_chunk_by_chunk(codes, chunk_size=100)
-        torch.testing.assert_close(gold_output, output, atol=1e-4, rtol=1e-4)
