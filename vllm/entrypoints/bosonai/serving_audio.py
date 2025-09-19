@@ -95,7 +95,7 @@ def load_voice_presets(state: State,
         except Exception as e:
             logger.error("Error loading voice presets: %s", str(e))
             logger.error("Detailed traceback:\n%s", traceback.format_exc())
-            time.sleep(interval)
+        time.sleep(interval)
 
 
 class HiggsAudioServingAudio(OpenAIServing):
